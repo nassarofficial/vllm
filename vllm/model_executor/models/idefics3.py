@@ -389,8 +389,8 @@ class Idefics3Connector(nn.Module):
         return x
 
     def forward(self, image_hidden_states: torch.Tensor) -> torch.Tensor:
-        image_hidden_states = self.pixel_shuffle(image_hidden_states,
-                                                 self.scale_factor)
+        # image_hidden_states = self.pixel_shuffle(image_hidden_states,
+        #                                          self.scale_factor)
         image_hidden_states = self.modality_projection(image_hidden_states)
         return image_hidden_states
 
