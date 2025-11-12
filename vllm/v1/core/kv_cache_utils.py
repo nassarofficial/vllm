@@ -16,7 +16,8 @@ from vllm.utils import GiB_bytes, cdiv, sha256_cbor
 from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
                                         FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheSpec,
-                                        KVCacheTensor, SlidingWindowSpec,
+                                        KVCacheTensor, MambaSpec,
+                                        SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -1121,6 +1122,9 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     has_chunked_local_attention = any(
         isinstance(spec, ChunkedLocalAttentionSpec)
         for spec in kv_cache_spec.values())
+    has_mamba = any(
+        isinstance(spec, MambaSpec) for spec in kv_cache_spec.values())
+    
     if has_full_attention and (has_sliding_window
                                or has_chunked_local_attention):
         for layer_name, spec in kv_cache_spec.items():
@@ -1140,9 +1144,25 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     dtype=spec.dtype,
                     attention_chunk_size=spec.attention_chunk_size,
                 )
+    
+    # For models with Mamba layers, we need to ensure page sizes are uniform
+    # across all layers. If Mamba layers are present, we keep them as-is since
+    # they can't be converted to FullAttentionSpec. The page sizes should be
+    # made uniform through the mamba_page_size_padded configuration.
+    if has_mamba:
+        # Mamba layers are kept as-is. The system should handle uniform page
+        # sizes through configuration. If page sizes are not uniform, we need
+        # to ensure they are handled by the uniform page size path in
+        # get_kv_cache_groups.
+        pass
 
     if not (is_kv_cache_spec_uniform(kv_cache_spec)
             or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec)):
+        # If we have Mamba + Attention layers, check if page sizes are uniform
+        if has_mamba and has_full_attention:
+            if is_kv_cache_page_size_uniform(kv_cache_spec):
+                # Page sizes are uniform, so we can proceed
+                return
         raise ValueError("Hybrid KV cache manager is disabled but failed to "
                          "convert the KV cache specs to one unified type.")
 
