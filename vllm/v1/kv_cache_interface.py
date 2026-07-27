@@ -471,6 +471,21 @@ class RSWASpec(FullAttentionSpec):
     """
 
     rswa_window: int
+    # Visibility extensions: gap eviction must be disabled when positions
+    # beyond the window can stay visible (grammar anchors / strided far past),
+    # and must skip the sink band when attention sinks are pinned.
+    rswa_no_evict: bool = False
+    rswa_sink: int = 0
+    # Anchor-selective eviction (block-compacted RSWAG): evict gap blocks
+    # EXCEPT those containing live grammar anchors, instead of blanket
+    # no-evict. Restores bounded KV for anchor configs. Needs the model path
+    # so the scheduler-side tracker can resolve DocLang tag ids.
+    rswa_anchor_evict: bool = False
+    rswa_model_path: str = ""
+    # Mirrored to the scheduler-side tracker so its keep-set matches the
+    # worker's anchor mask exactly.
+    rswa_keep_all_locs: bool = False
+    rswa_closed_trail_k: int = 0
 
     @classmethod
     def merge(cls, specs: list[RSWASpec]) -> RSWASpec:
@@ -496,6 +511,15 @@ class RSWASpec(FullAttentionSpec):
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
             rswa_window=rswa_windows.pop(),
+            rswa_no_evict=any(spec.rswa_no_evict for spec in specs),
+            rswa_sink=max(spec.rswa_sink for spec in specs),
+            rswa_anchor_evict=any(spec.rswa_anchor_evict for spec in specs),
+            rswa_keep_all_locs=any(spec.rswa_keep_all_locs for spec in specs),
+            rswa_closed_trail_k=max(spec.rswa_closed_trail_k for spec in specs),
+            rswa_model_path=next(
+                (spec.rswa_model_path for spec in specs if spec.rswa_model_path),
+                "",
+            ),
         )
 
 

@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -287,6 +288,47 @@ class FlashAttentionMetadata:
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
 
+    # FA2/FA3 two-pass R-SWA (fa_version < 4, where mask_mod is unavailable).
+    # The R-SWA visibility set (prefix ∪ recent window) is decomposed into two
+    # disjoint native FA calls merged by LSE:
+    #   call A: plain causal over kv [0, seqused_a) where seqused_a is the
+    #     prefix length rounded up to a block boundary (clamped to seq_len,
+    #     so prefill-phase rows reduce to exact full causal on call A alone);
+    #   call B: causal + FA-native sliding window over the generated region,
+    #     addressed via a per-view block-table gathered from the first fully
+    #     generated block (evicted gap blocks fall outside the window).
+    # "View" rows normally equal request rows; preemption-recompute rows
+    # (q_len > 1 spanning generated tokens) are exploded into q_len views of
+    # length 1 so each token gets its own alignment (rswa_cu_seqlens_q set).
+    rswa_seqused_a: torch.Tensor | None = None  # [num_views] int32
+    rswa_seqused_b: torch.Tensor | None = None  # [num_views] int32, >= 1
+    rswa_b_block_table: torch.Tensor | None = None  # [num_views, max_blocks]
+    rswa_b_valid_tokens: torch.Tensor | None = None  # [num_tokens] bool
+    rswa_cu_seqlens_q: torch.Tensor | None = None  # exploded views only
+    rswa_max_seqlen_q: int | None = None  # exploded views only
+    rswa_a_block_table: torch.Tensor | None = None  # exploded views only
+    # RSWAG decode-side grammar anchors (call C): non-causal attention over
+    # the gap blocks (strictly between call A's prefix boundary and call B's
+    # window) that contain at least one live anchor token, triple-merged by
+    # LSE. Block-granular: every token in an anchor-containing block stays
+    # visible, a superset of the exact per-token Triton anchor mask. Anchors
+    # force no-evict (RSWASpec.rswa_no_evict), so gap blocks are resident.
+    # Skipped (rswa_c_valid_tokens False) for exploded replay views.
+    rswa_seqused_c: torch.Tensor | None = None  # [num_views] int32, >= 1
+    rswa_c_block_table: torch.Tensor | None = None  # [num_views, max_blocks]
+    rswa_c_valid_tokens: torch.Tensor | None = None  # [num_tokens] bool
+    # Packed resident-view R-SWA (VLLM_RSWA_PACKED=1): anchor-selective
+    # eviction makes resident = prefix + window (+ anchor blocks), so the
+    # whole visible set is expressible as ONE gathered block table over
+    # non-null blocks and ONE plain causal call — no masks, no window
+    # primitive, no LSE merges. Backend-universal by construction (any paged
+    # kernel takes block_table + seqused). Block-granular semantics, same as
+    # the validated call-C/two-pass superset. The KV-write path keeps the true
+    # table; RoPE is baked into cached K so the packed view needs no position
+    # fixup.
+    rswa_packed_block_table: torch.Tensor | None = None  # [num_reqs, max_blocks]
+    rswa_packed_seqused: torch.Tensor | None = None  # [num_reqs] int32
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -432,7 +474,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.aot_sliding_window: tuple[int, int] | None = None
 
         # R-SWA: persistent CUDA-graph-safe buffers owned by this builder.
-        self.rswa_window: int | None = self.model_config.rswa_window
+        # Read the window off this builder's own KV cache spec, not the model
+        # config: hybrid stacks mix RSWASpec and FullAttentionSpec groups, and
+        # only the former mask. Non-R-SWA groups get None and take the plain
+        # FlashAttention path.
+        self.rswa_window: int | None = getattr(kv_cache_spec, "rswa_window", None)
         self.persistent_rswa_prefix_lens: torch.Tensor | None = None
         self.persistent_rswa_window_tensor: torch.Tensor | None = None
         if self.rswa_window is not None:
@@ -443,6 +489,54 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.persistent_rswa_window_tensor = torch.tensor(
                 [self.rswa_window], dtype=torch.int32, device=self.device
             )
+            # FA2/FA3 two-pass buffers (unused by FA4/mask_mod but cheap).
+            max_num_tokens = max(
+                vllm_config.scheduler_config.max_num_batched_tokens, max_num_reqs
+            )
+            self.persistent_rswa_seqused_a = torch.zeros(
+                max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self.persistent_rswa_seqused_b = torch.ones(
+                max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self.persistent_rswa_b_valid_tokens = torch.zeros(
+                max_num_tokens, dtype=torch.bool, device=self.device
+            )
+            self.persistent_rswa_b_offsets = torch.zeros(
+                max_num_reqs, dtype=torch.int64, device=self.device
+            )
+            # Gather workspace for the call-B block-table view; width is only
+            # known once the block table is seen, so allocate lazily in build().
+            self.persistent_rswa_b_block_table: torch.Tensor | None = None
+            self._rswa_gather_idx: torch.Tensor | None = None
+            # Packed resident-view mode (VLLM_RSWA_PACKED=1): one causal call
+            # over the gathered non-null block table; supersedes the
+            # two-pass + call-C machinery below when enabled.
+            # Packed single-call view is the DEFAULT FA path since its
+            # same-node vs 7.13/6.73 (FA3/FA2 full attention) — and it is
+            # the only anchors path FA2 survives. VLLM_RSWA_TWOPASS=1
+            # restores the 3-kernel two-pass (validated for the 16k
+            # long-decode serving regime, unmeasured for packed).
+            self.rswa_view_pack = os.environ.get("VLLM_RSWA_TWOPASS") != "1"
+            self.persistent_rswa_packed_seqused = torch.ones(
+                max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self.persistent_rswa_packed_table: torch.Tensor | None = None
+            # Call C (RSWAG anchor pass) buffers; lazy like B's block table.
+            self.persistent_rswa_seqused_c = torch.ones(
+                max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self.persistent_rswa_c_valid_tokens = torch.zeros(
+                max_num_tokens, dtype=torch.bool, device=self.device
+            )
+            self._rswa_c_lo = torch.zeros(
+                max_num_reqs, dtype=torch.int64, device=self.device
+            )
+            self._rswa_c_hi = torch.zeros(
+                max_num_reqs, dtype=torch.int64, device=self.device
+            )
+            self.persistent_rswa_c_block_table: torch.Tensor | None = None
+            self.persistent_rswa_a_ext_table: torch.Tensor | None = None
 
     def build(
         self,
@@ -711,8 +805,242 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             attn_metadata.rswa_prefix_lens = rswa_prefix_lens
             attn_metadata.rswa_window = self.rswa_window
             attn_metadata.rswa_window_tensor = self.persistent_rswa_window_tensor
+            if self.rswa_view_pack:
+                self._build_rswa_packed_view(
+                    attn_metadata, common_attn_metadata, num_reqs
+                )
+            else:
+                self._build_rswa_two_pass(
+                    attn_metadata, common_attn_metadata, num_reqs, num_actual_tokens
+                )
 
         return attn_metadata
+
+    def _build_rswa_packed_view(
+        self,
+        attn_metadata: FlashAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_reqs: int,
+    ) -> None:
+        """Pack each request's VISIBLE blocks (deterministic v2) into one table.
+
+        View = prefix blocks + anchor-bearing gap blocks + trailing window
+        blocks, computed from positions and the anchor mask each step —
+        never from eviction residency (v1's flaw: visibility followed the
+        lagging free stream and 38% of pages looped). One plain causal call
+        over the packed view reproduces block-granular R-SWA(+anchors) on
+        any FA version, one kernel per layer. A stable
+        argsort keeps ascending block order, so the view's tail is the true
+        sequence tail and bottom-right causal alignment is exact for the
+        query suffix. Entries past ``seqused`` are junk the kernel never
+        reads. Null block id is the reserved block 0.
+        """
+        bt = common_attn_metadata.block_table_tensor[:num_reqs]
+        nb = bt.shape[1]
+        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        bs = self.block_size
+        if (
+            self.persistent_rswa_packed_table is None
+            or self.persistent_rswa_packed_table.shape[1] < nb
+        ):
+            max_num_reqs = self.persistent_rswa_packed_seqused.shape[0]
+            self.persistent_rswa_packed_table = torch.zeros(
+                max_num_reqs, nb, dtype=bt.dtype, device=self.device
+            )
+            self._rswa_pack_arange = torch.arange(
+                nb, dtype=torch.int64, device=self.device
+            )
+        arange = self._rswa_pack_arange[:nb]
+        num_blocks = (seq_lens.to(torch.int64) + (bs - 1)) // bs
+        # Deterministic visibility: prefix + trailing window blocks + anchor
+        # blocks. Block granularity makes the effective window oscillate in
+        # [W, W+bs) — monotone-extra visibility (w256 >= w128 quality held).
+        prefix_lens = self.persistent_rswa_prefix_lens[:num_reqs].to(torch.int64)
+        prefix_blocks = (prefix_lens + (bs - 1)) // bs
+        win = int(self.rswa_window) if self.rswa_window is not None else 0
+        win_start_blk = (seq_lens.to(torch.int64) - win).clamp(min=0) // bs
+        keep = (arange[None, :] < prefix_blocks[:, None]) | (
+            arange[None, :] >= win_start_blk[:, None]
+        )
+        anchor_mask = common_attn_metadata.rswa_anchor_mask
+        if anchor_mask is not None:
+            nbm = min(nb, anchor_mask.shape[1] // bs)
+            if nbm > 0:
+                blk_anchor = (
+                    anchor_mask[:num_reqs, : nbm * bs]
+                    .reshape(num_reqs, nbm, bs)
+                    .amax(dim=-1)
+                    > 0
+                )
+                keep[:, :nbm] |= blk_anchor
+        # Null-block intersect is safety only: the 25k-step in-vivo audit
+        # proved prefix/window/anchor blocks are never evicted, so this
+        # cannot remove true visibility.
+        valid = (arange[None, :] < num_blocks[:, None]) & keep & (bt != 0)
+        order = torch.argsort((~valid).to(torch.int8), dim=1, stable=True)
+        packed = self.persistent_rswa_packed_table[:num_reqs, :nb]
+        torch.gather(bt, 1, order, out=packed)
+        n_resident = valid.sum(dim=1, dtype=torch.int64)
+        # Tail tokens of the (always-resident) last real block.
+        tail = seq_lens.to(torch.int64) - (num_blocks - 1).clamp(min=0) * bs
+        seqused = ((n_resident - 1).clamp(min=0) * bs + tail).clamp(min=1)
+        self.persistent_rswa_packed_seqused[:num_reqs].copy_(
+            seqused.to(torch.int32)
+        )
+        attn_metadata.rswa_packed_block_table = packed
+        attn_metadata.rswa_packed_seqused = self.persistent_rswa_packed_seqused[
+            :num_reqs
+        ]
+
+    def _build_rswa_two_pass(
+        self,
+        attn_metadata: FlashAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_reqs: int,
+        num_actual_tokens: int,
+    ) -> None:
+        """Precompute FA2/FA3 two-pass R-SWA tensors (see metadata docstring).
+
+        All arithmetic runs on CPU copies; results land in persistent CUDA
+        buffers so the captured decode graph can read them.  Rows in
+        preemption-recompute (q_len > 1 while seq_len exceeds the prompt)
+        cannot be expressed with per-request causal alignment, so such
+        batches are rebuilt with those rows exploded into 1-token views
+        (rare, always eager)."""
+        bs = self.kv_cache_spec.block_size
+        block_table_tensor = common_attn_metadata.block_table_tensor
+        prefix_cpu = common_attn_metadata.rswa_prefix_lens[:num_reqs].to(torch.int64)
+        seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs].to(torch.int64)
+        qsl_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+        q_lens_cpu = (qsl_cpu[1:] - qsl_cpu[:-1]).to(torch.int64)
+
+        replay = (q_lens_cpu > 1) & (seq_lens_cpu > prefix_cpu)
+        if not bool(replay.any()):
+            view_t = seq_lens_cpu
+            view_prefix = prefix_cpu
+            view_qlens = q_lens_cpu
+            view_src = None
+        else:
+            # Explode replay rows: token at position p becomes its own view
+            # with virtual seq_len p + 1, giving it exact causal alignment.
+            vt, vp, vq, vs = [], [], [], []
+            for i in range(num_reqs):
+                t_i = int(seq_lens_cpu[i])
+                q_i = int(q_lens_cpu[i])
+                if bool(replay[i]):
+                    for j in range(q_i):
+                        vt.append(t_i - q_i + 1 + j)
+                        vq.append(1)
+                        vp.append(int(prefix_cpu[i]))
+                        vs.append(i)
+                else:
+                    vt.append(t_i)
+                    vq.append(q_i)
+                    vp.append(int(prefix_cpu[i]))
+                    vs.append(i)
+            view_t = torch.tensor(vt, dtype=torch.int64)
+            view_prefix = torch.tensor(vp, dtype=torch.int64)
+            view_qlens = torch.tensor(vq, dtype=torch.int64)
+            view_src = torch.tensor(vs, dtype=torch.int64)
+
+        off = -(-view_prefix // bs)  # cdiv: first fully-generated block
+        boundary = off * bs
+        seqused_a = torch.minimum(boundary, view_t)
+        seqused_b_raw = (view_t - boundary).clamp(min=0)
+        b_valid = seqused_b_raw > 0
+        seqused_b = seqused_b_raw.clamp(min=1)
+        # num_actual_tokens may exceed the cu_seqlens-covered token count
+        # (padding); pad the per-token mask with False — padded rows are
+        # never consumed.
+        total_q = int(view_qlens.sum())
+        if total_q == view_t.shape[0]:
+            covered = b_valid
+        else:
+            covered = torch.repeat_interleave(b_valid, view_qlens)
+        b_valid_tokens = torch.zeros(num_actual_tokens, dtype=torch.bool)
+        n_cov = min(total_q, num_actual_tokens)
+        b_valid_tokens[:n_cov] = covered[:n_cov]
+
+        num_views = view_t.shape[0]
+        nb = block_table_tensor.shape[1]
+        if view_src is None:
+            # Persistent-buffer path (CUDA-graph safe).
+            self.persistent_rswa_seqused_a[:num_views].copy_(
+                seqused_a.to(torch.int32), non_blocking=True
+            )
+            self.persistent_rswa_seqused_b[:num_views].copy_(
+                seqused_b.to(torch.int32), non_blocking=True
+            )
+            self.persistent_rswa_b_valid_tokens[:num_actual_tokens].copy_(
+                b_valid_tokens[:num_actual_tokens], non_blocking=True
+            )
+            self.persistent_rswa_b_offsets[:num_views].copy_(
+                off, non_blocking=True
+            )
+            if (
+                self.persistent_rswa_b_block_table is None
+                or self.persistent_rswa_b_block_table.shape[1] < nb
+            ):
+                max_num_reqs = self.persistent_rswa_seqused_a.shape[0]
+                self.persistent_rswa_b_block_table = torch.zeros(
+                    max_num_reqs, nb, dtype=block_table_tensor.dtype,
+                    device=self.device,
+                )
+                self._rswa_gather_idx = torch.zeros(
+                    max_num_reqs, nb, dtype=torch.int64, device=self.device
+                )
+                self._rswa_arange = torch.arange(
+                    nb, dtype=torch.int64, device=self.device
+                )
+            idx = self._rswa_gather_idx[:num_views, :nb]
+            torch.add(
+                self._rswa_arange[:nb],
+                self.persistent_rswa_b_offsets[:num_views, None],
+                out=idx,
+            )
+            idx.clamp_(max=nb - 1)
+            b_bt = self.persistent_rswa_b_block_table[:num_views, :nb]
+            torch.gather(block_table_tensor[:num_views], 1, idx, out=b_bt)
+            attn_metadata.rswa_seqused_a = self.persistent_rswa_seqused_a[:num_views]
+            attn_metadata.rswa_seqused_b = self.persistent_rswa_seqused_b[:num_views]
+            attn_metadata.rswa_b_block_table = b_bt
+            attn_metadata.rswa_b_valid_tokens = self.persistent_rswa_b_valid_tokens[
+                :num_actual_tokens
+            ]
+            # Two-pass R-SWA uses prefix+window only. Grammar anchors are
+            # served by the packed resident-view path (default) or TRITON_ATTN.
+        else:
+            # Exploded replay path: fresh tensors, never CUDA-graph captured.
+            dev = self.device
+            view_src_gpu = view_src.to(dev, non_blocking=True)
+            a_bt = block_table_tensor[:num_reqs].index_select(0, view_src_gpu)
+            off_gpu = off.to(dev, non_blocking=True)
+            idx = (
+                torch.arange(nb, dtype=torch.int64, device=dev)[None, :]
+                + off_gpu[:, None]
+            ).clamp_(max=nb - 1)
+            b_bt = torch.gather(a_bt, 1, idx)
+            cu = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int64),
+                    torch.cumsum(view_qlens, 0),
+                ]
+            ).to(torch.int32)
+            attn_metadata.rswa_seqused_a = seqused_a.to(
+                dev, dtype=torch.int32, non_blocking=True
+            )
+            attn_metadata.rswa_seqused_b = seqused_b.to(
+                dev, dtype=torch.int32, non_blocking=True
+            )
+            attn_metadata.rswa_a_block_table = a_bt
+            attn_metadata.rswa_b_block_table = b_bt
+            attn_metadata.rswa_b_valid_tokens = b_valid_tokens.to(
+                dev, non_blocking=True
+            )
+            attn_metadata.rswa_cu_seqlens_q = cu.to(dev, non_blocking=True)
+            attn_metadata.rswa_max_seqlen_q = int(view_qlens.max())
+            # Anchor pass C is skipped on exploded replay views (rare, eager);
+            # those recompute steps serve prefix+window only.
 
     def update_block_table(
         self,
@@ -979,6 +1307,59 @@ class FlashAttentionImpl(AttentionImpl):
                     )
                     mm_aux = [mm_prefix_ranges]
 
+                # Packed resident-view R-SWA: eviction already removed the
+                # invisible gap, so ONE plain causal call over the gathered
+                # non-null block table reproduces the mask — on any FA
+                # version (and, symmetrically, any paged backend).
+                if (
+                    attn_metadata.rswa_packed_seqused is not None
+                    and not is_dynamic_causal
+                    and causal is True
+                ):
+                    flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=attn_metadata.query_start_loc,
+                        max_seqlen_q=attn_metadata.max_query_len,
+                        seqused_k=attn_metadata.rswa_packed_seqused,
+                        max_seqlen_k=attn_metadata.max_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=self.alibi_slopes,
+                        block_table=attn_metadata.rswa_packed_block_table,
+                        softcap=self.logits_soft_cap,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
+                    return output
+
+                # R-SWA on FA2/FA3: mask_mod is FA4-only, so decompose the
+                # visibility set into two disjoint native FA calls (prefix,
+                # windowed generated region) and LSE-merge them.
+                if (
+                    attn_metadata.rswa_seqused_a is not None
+                    and self.vllm_flash_attn_version != 4
+                    and not is_dynamic_causal
+                    and causal is True
+                ):
+                    return self._forward_rswa_two_pass(
+                        query,
+                        key_cache,
+                        value_cache,
+                        output,
+                        attn_metadata,
+                        num_actual_tokens,
+                        q_descale,
+                        k_descale,
+                        v_descale,
+                    )
+
                 # R-SWA: use CuTE-DSL mask_mod on FA4 for exact token-level
                 # mask without block-size approximation.  The mask_mod encodes
                 # "causal AND (kv < prefix_len OR q - kv < rswa_window)", which
@@ -1066,6 +1447,163 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=layer._v_scale,
             s_aux=self.sinks,
         )
+        return output
+
+    def _forward_rswa_two_pass(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        num_actual_tokens: int,
+        q_descale: torch.Tensor | None,
+        k_descale: torch.Tensor | None,
+        v_descale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Exact R-SWA on FA2/FA3 via two native FA calls + LSE merge.
+
+        Call A: plain causal over kv [0, seqused_a), where seqused_a is the
+        prompt length rounded up to a KV-block boundary (clamped to seq_len).
+        Prefill-phase rows therefore reduce to exact full causal under call A
+        alone.  The <= block_size-1 generated tokens swept in by the round-up
+        stay permanently visible — an implicit micro-sink; the RSWA manager
+        never evicts the prompt-tail block, so they are always resident.
+
+        Call B: causal + FA-native sliding window over the generated region,
+        addressed through a per-view block-table gathered from the first
+        fully-generated block.  Evicted gap blocks lie outside the window, so
+        FA's window skipping never touches them and per-step cost is O(window).
+
+        The two visibility sets are disjoint (A ends at the block boundary
+        where B's view begins), so merge_attn_states reconstructs the exact
+        softmax.  Rows with an empty generated region ran call B against a
+        clamped 1-token null view (finite garbage) and are overwritten with
+        call A's output afterwards."""
+        cu_q = attn_metadata.rswa_cu_seqlens_q
+        if cu_q is None:
+            cu_q = attn_metadata.query_start_loc
+            max_q = attn_metadata.max_query_len
+            a_bt = (
+                attn_metadata.rswa_a_block_table
+                if attn_metadata.rswa_a_block_table is not None
+                else attn_metadata.block_table
+            )
+        else:
+            max_q = attn_metadata.rswa_max_seqlen_q
+            a_bt = attn_metadata.rswa_a_block_table
+
+        q = query[:num_actual_tokens]
+        out = output[:num_actual_tokens]
+        a_out = torch.empty_like(out)
+        b_out = torch.empty_like(out)
+
+        _, a_lse = flash_attn_varlen_func(
+            q=q,
+            k=key_cache,
+            v=value_cache,
+            out=a_out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max_q,
+            seqused_k=attn_metadata.rswa_seqused_a,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            block_table=a_bt,
+            softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
+            s_aux=self.sinks,
+        )
+        assert attn_metadata.rswa_window is not None
+        _, b_lse = flash_attn_varlen_func(
+            q=q,
+            k=key_cache,
+            v=value_cache,
+            out=b_out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max_q,
+            seqused_k=attn_metadata.rswa_seqused_b,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            window_size=[attn_metadata.rswa_window - 1, 0],
+            block_table=attn_metadata.rswa_b_block_table,
+            softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
+        )
+        # RSWAG anchor pass (call C) is FA3/FA4 only. Under FA2 it triggers a
+        # reproducible illegal-instruction fault at concurrency (>=32 reqs,
+        # natural anchor growth) that survived two rounds of fixes (causal
+        # semantics, avoiding merge_attn_states' output_lse argument); a
+        # same-scale FA3 control ran clean, isolating the fault to FA2's own
+        # kernel rather than this method's tensor construction. Anchors
+        # degrade to prefix+window-only under FA2, matching the existing
+        # Triton-only sink/stride degrade pattern (see models/config.py).
+        if attn_metadata.rswa_seqused_c is None or self.vllm_flash_attn_version == 2:
+            merge_attn_states(out, a_out, a_lse, b_out, b_lse)
+            valid = attn_metadata.rswa_b_valid_tokens.view(-1, 1, 1)
+            torch.where(valid, out, a_out, out=out)
+            return output
+
+        # RSWAG anchor pass (call C): non-causal over anchor-bearing gap
+        # blocks, folded in by a second LSE merge. merge_attn_states's
+        # output_lse kernel argument crashes under FA2 at scale (illegal
+        # instruction — a device-assert on some FA2-specific tensor property,
+        # 266427); avoid it entirely. The LSE of two disjoint softmax sets is
+        # exactly logaddexp(a_lse, b_lse) — the same combination the kernel
+        # performs internally — so this is a portable, kernel-free substitute.
+        # Rows overwritten by the b_valid fix keep an ab_lse computed against
+        # garbage b_lse, but such rows have no generated region, hence no gap
+        # anchors, hence c_valid False — the final torch.where never consumes
+        # their merged value, so the inconsistency is inert.
+        merge_attn_states(out, a_out, a_lse, b_out, b_lse)
+        valid = attn_metadata.rswa_b_valid_tokens.view(-1, 1, 1)
+        torch.where(valid, out, a_out, out=out)
+        ab_lse = torch.logaddexp(a_lse, b_lse)
+
+        # causal=True, not False: for the q_len==1 decode rows that C serves,
+        # a causal query at the end of the gathered view sees the whole view —
+        # identical visibility — while FA2 crashes (async CUBLAS fault) on the
+        # non-causal + paged-KV + LSE combination. Multi-token rows differ
+        # under causal but are discarded via rswa_c_valid_tokens.
+        c_out = torch.empty_like(out)
+        _, c_lse = flash_attn_varlen_func(
+            q=q,
+            k=key_cache,
+            v=value_cache,
+            out=c_out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max_q,
+            seqused_k=attn_metadata.rswa_seqused_c,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            block_table=attn_metadata.rswa_c_block_table,
+            softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
+        )
+        merged = torch.empty_like(out)
+        merge_attn_states(merged, out, ab_lse, c_out, c_lse)
+        c_valid = attn_metadata.rswa_c_valid_tokens.view(-1, 1, 1)
+        torch.where(c_valid, merged, out, out=out)
         return output
 
     def do_kv_cache_update(

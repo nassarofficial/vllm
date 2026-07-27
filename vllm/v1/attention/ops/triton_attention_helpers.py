@@ -287,6 +287,15 @@ def compute_kv_seq_mask(
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    # R-SWA visibility extensions (all default-off; see rswa_anchor_tracker.py):
+    # per-seq byte mask of live DocLang grammar-anchor positions, attention
+    # sinks (first N generated tokens), and strided far-past coverage.
+    rswa_anchor_mask_ptr=None,
+    rswa_anchor_stride=0,
+    rswa_anchor_len=0,
+    USE_R_SWA_ANCHORS: tl.constexpr = False,
+    R_SWA_SINK: tl.constexpr = 0,
+    R_SWA_STRIDE: tl.constexpr = 0,
 ):
     """Build the KV mask for one tile.
 
@@ -340,7 +349,30 @@ def compute_kv_seq_mask(
         prefix_len = tl.load(rswa_prefix_lens_ptr + seq_idx)
         in_prefix = seq_offset[None, :] < prefix_len
         in_window = (query_abs_pos - seq_offset) < R_SWA_WINDOW
-        seq_mask = seq_mask & (in_prefix | in_window)
+        rswa_vis = in_prefix | in_window
+        if R_SWA_SINK > 0:
+            # tokens stay permanently visible.
+            gen_off = seq_offset[None, :] - prefix_len
+            rswa_vis = rswa_vis | ((gen_off >= 0) & (gen_off < R_SWA_SINK))
+        if R_SWA_STRIDE > 0:
+            # Strided far past: every R_SWA_STRIDE-th generated token stays
+            # visible beyond the window (fuzzy global coverage).
+            gen_off_s = seq_offset[None, :] - prefix_len
+            rswa_vis = rswa_vis | (
+                (gen_off_s >= 0) & (gen_off_s % R_SWA_STRIDE == 0)
+            )
+        if USE_R_SWA_ANCHORS:
+            # Live DocLang grammar anchors (per-seq byte mask over absolute
+            # KV positions, maintained by RswaAnchorEngine in the runner).
+            anchor_live = tl.load(
+                rswa_anchor_mask_ptr
+                + seq_idx.to(tl.int64) * rswa_anchor_stride
+                + seq_offset,
+                mask=seq_offset < rswa_anchor_len,
+                other=0,
+            )
+            rswa_vis = rswa_vis | (anchor_live[None, :] != 0)
+        seq_mask = seq_mask & rswa_vis
 
     # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
     # Default (MM_PREFIX_CLAMP_SW=False): applied AFTER sliding window so

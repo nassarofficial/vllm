@@ -338,6 +338,7 @@ class KVCacheCoordinator(ABC):
         request_id: str,
         processed_computed_tokens: int,
         num_prompt_tokens: int | None = None,
+        token_ids=None,
     ) -> None:
         """
         Remove the blocks that are no longer needed from `blocks` and replace
@@ -353,7 +354,10 @@ class KVCacheCoordinator(ABC):
         """
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(
-                request_id, processed_computed_tokens, num_prompt_tokens
+                request_id,
+                processed_computed_tokens,
+                num_prompt_tokens,
+                token_ids=token_ids,
             )
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:

@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -666,6 +667,55 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+
+        # R-SWA decode-side DocLang grammar anchors (opt-in via HF config
+        # ``rswa_decode_anchors="grammar"``; see worker/rswa_anchor_tracker.py).
+        self.rswa_anchor_engine = None
+        self.rswa_anchor_mask_cpu: torch.Tensor | None = None
+        self.rswa_anchor_mask_gpu: torch.Tensor | None = None
+        self._rswa_debug_all_anchors = False
+        self._rswa_anchor_profile = None
+        # req_id -> last batch slot, for incremental anchor-mask staging.
+        self._rswa_slot_of: dict[str, int] = {}
+        _rswa_hf_cfg = getattr(self.model_config, "hf_config", None)
+        if (
+            self.model_config.rswa_window is not None
+            and getattr(_rswa_hf_cfg, "rswa_decode_anchors", "none") == "grammar"
+        ):
+            from vllm.v1.worker.rswa_anchor_tracker import RswaAnchorEngine
+
+            self.rswa_anchor_engine = RswaAnchorEngine(
+                self.model_config.model,
+                self.max_model_len,
+                keep_all_locs=bool(
+                    getattr(_rswa_hf_cfg, "rswa_keep_all_locs", False)
+                ),
+                closed_trail_k=int(
+                    getattr(_rswa_hf_cfg, "rswa_closed_trail_k", 0) or 0
+                ),
+            )
+            _rswa_max_seqs = self.scheduler_config.max_num_seqs
+            # Pinned: the per-step H2D copy of this buffer uses
+            # non_blocking=True, which silently degrades to a synchronous
+            # pageable copy (~1 ms/step at 256 seqs x 32k) unless the source
+            # is page-locked.
+            self.rswa_anchor_mask_cpu = torch.zeros(
+                (_rswa_max_seqs, self.max_model_len),
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+            self.rswa_anchor_mask_gpu = torch.zeros(
+                (_rswa_max_seqs, self.max_model_len),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            logger.info(
+                "R-SWA decode grammar anchors enabled (keep_all_locs=%s, "
+                "closed_trail_k=%s).",
+                getattr(_rswa_hf_cfg, "rswa_keep_all_locs", False),
+                getattr(_rswa_hf_cfg, "rswa_closed_trail_k", 0),
+            )
+
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -2391,6 +2441,47 @@ class GPUModelRunner(
         if self.model_config.rswa_window is not None:
             rswa_prefix_lens = num_prompt_tokens_cpu
 
+        # R-SWA grammar anchors: advance each running request's DocLang
+        # tracker over its newly sampled tokens and stage the per-request
+        # anchor byte masks (engine-owned rows) into batch-slot order.
+        rswa_anchor_mask = None
+        if self.rswa_anchor_engine is not None:
+            _prof = self._rswa_anchor_profile
+            if _prof is not None:
+                _t0 = time.perf_counter()
+            staging = self.rswa_anchor_mask_cpu.numpy()
+            # in both regimes — 898s vs 485s real pages, 13.5k vs 14.4k
+            # serving — per-event Python bookkeeping exceeded the flat 2MB/
+            for req_id in self.input_batch.req_ids:
+                req_state = self.requests[req_id]
+                row = self.rswa_anchor_engine.advance(
+                    req_id,
+                    req_state.num_prompt_tokens,
+                    req_state.output_token_ids,
+                )
+                slot = self.input_batch.req_id_to_index[req_id]
+                staging[slot, :] = row
+            self.rswa_anchor_engine.prune(self.requests)
+            if _prof is not None:
+                _prof[0] += time.perf_counter() - _t0
+                _prof[1] += 1
+                if _prof[1] % 200 == 0:
+                    resets = getattr(self.rswa_anchor_engine, "reset_count", -1)
+                    logger.info(
+                        "RSWA anchor profile: %.1f ms/step avg over %d steps "
+                        "(engine resets: %s)",
+                        1000 * _prof[0] / _prof[1],
+                        _prof[1],
+                        resets,
+                    )
+            if self._rswa_debug_all_anchors:
+                staging[:] = 1
+            n_rows = min(num_reqs_padded, self.rswa_anchor_mask_gpu.shape[0])
+            self.rswa_anchor_mask_gpu[:n_rows].copy_(
+                self.rswa_anchor_mask_cpu[:n_rows], non_blocking=True
+            )
+            rswa_anchor_mask = self.rswa_anchor_mask_gpu[:n_rows]
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2409,6 +2500,7 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            rswa_anchor_mask=rswa_anchor_mask,
         )
 
         if self.dcp_world_size > 1:
