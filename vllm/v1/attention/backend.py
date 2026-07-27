@@ -466,6 +466,15 @@ class CommonAttentionMetadata:
     """(batch_size,) CPU ring origin for Mamba2 ReplaySSM decode: num_computed
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
+    rswa_anchor_mask: torch.Tensor | None = None
+    """(batch_size, max_model_len) uint8 device tensor of live DocLang
+    grammar-anchor positions for R-SWA decode (1 = visible past the window).
+    Owned/persisted by the model runner (rows ordered by batch slot); None
+    when grammar-anchor decode is disabled."""
+
+    # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
+    _seq_lens_cpu: torch.Tensor | None = None
+    _num_computed_tokens_cpu: torch.Tensor | None = None
 
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
@@ -548,6 +557,7 @@ class CommonAttentionMetadata:
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+            rswa_anchor_mask=maybe_slice_reqs(self.rswa_anchor_mask),
         )
 
 
