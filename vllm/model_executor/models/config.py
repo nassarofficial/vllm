@@ -183,7 +183,7 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
                 "Use FLASH_ATTN (FA4), TRITON_ATTN or FLEX_ATTENTION."
             )
 
-        from vllm.model_executor.models.granitemoehybrid import (
+        from vllm.model_executor.models.granite_for_docling import (
             resolve_rswa_full_attn_layers,
         )
 
@@ -193,12 +193,15 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
         ) or vllm_config.model_config.hf_config
         full_layers = resolve_rswa_full_attn_layers(text_cfg)
         if full_layers:
+            n_layers = int(getattr(text_cfg, "num_hidden_layers", 0) or 0)
+            if not n_layers and getattr(text_cfg, "layer_types", None):
+                n_layers = len(text_cfg.layer_types)
             logger.info(
                 "Unlimited-OCR: hybrid R-SWA — layers %s keep full attention "
                 "(%d/%d); their KV is never evicted.",
                 sorted(full_layers),
                 len(full_layers),
-                len(text_cfg.layer_types),
+                n_layers,
             )
 
         # R-SWA windows the *generated* tokens, so a decode-token's KV is not a
