@@ -224,6 +224,12 @@ def kernel_unified_attention(
     rswa_prefix_lens_ptr,
     R_SWA_WINDOW: tl.constexpr,  # int
     USE_R_SWA: tl.constexpr,  # bool
+    rswa_anchor_mask_ptr,  # [num_seqs, anchor_len] uint8, or dummy
+    rswa_anchor_stride: tl.int64,  # int
+    rswa_anchor_len: tl.int32,  # int
+    USE_R_SWA_ANCHORS: tl.constexpr,  # bool
+    R_SWA_SINK: tl.constexpr,  # int
+    R_SWA_STRIDE: tl.constexpr,  # int
     stride_k_cache_0: tl.int64,  # int
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
@@ -421,167 +427,204 @@ def kernel_unified_attention(
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
-
-        if USE_TD:
-            # All TILE_SIZE slots within a single KV tile map to one
-            # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
-            # from the static_assert above), so load the block index as
-            # a scalar instead of a broadcast reduction.
-            offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
-            physical_block_scalar = tl.load(
-                block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
-            ).to(tl.int64)
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = _load_kv_tile_td(
-                key_cache_ptr,
-                physical_block_scalar,
-                kv_head_idx,
-                offset_in_block,
-                stride_k_cache_0,
-                stride_k_cache_1,
-                stride_k_cache_2,
-                stride_k_cache_3,
-                BLOCK_SIZE,
-                TILE_SIZE,
-                HEAD_SIZE,
-                HEAD_SIZE_PADDED,
-            ).T
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = _load_kv_tile_td(
-                value_cache_ptr,
-                physical_block_scalar,
-                kv_head_idx,
-                offset_in_block,
-                stride_v_cache_0,
-                stride_v_cache_1,
-                stride_v_cache_2,
-                stride_v_cache_3,
-                BLOCK_SIZE,
-                TILE_SIZE,
-                HEAD_SIZE,
-                HEAD_SIZE_PADDED,
+        # --- R-SWA fully-masked-tile skip -------------------------------
+        # For R-SWA the tile loop must span [0, seq_len) (prefix visible at
+        # the front, window at the back), so unlike plain sliding window the
+        # loop bounds cannot exclude the masked gap. Instead, skip a tile
+        # outright when it is provably invisible to every query in this
+        # block: past the prefix+sink band, entirely below every query's
+        # window start, and carrying no live anchor bytes. Skipping is
+        # mathematically exact: fully -inf tiles contribute exp(-inf)=0 to
+        # M, L and acc. Gated off under R_SWA_STRIDE (strided far-past
+        # keeps arbitrary gap positions visible).
+        tile_visible = True
+        if USE_R_SWA and R_SWA_STRIDE == 0:
+            rswa_tile_lo = j * TILE_SIZE
+            rswa_tile_hi = rswa_tile_lo + TILE_SIZE
+            rswa_prefix_s = tl.load(rswa_prefix_lens_ptr + seq_idx)
+            rswa_qmin_abs = context_len + q_block_local_idx * BLOCK_Q
+            rswa_gap_tile = (rswa_tile_lo >= rswa_prefix_s + R_SWA_SINK) & (
+                rswa_qmin_abs - (rswa_tile_hi - 1) >= R_SWA_WINDOW
             )
-        else:
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-            )
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
-
-        # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
-        if USE_PER_TOKEN_HEAD_SCALES:
-            scale_idx = (
-                physical_block_idx * stride_ks_blk
-                + (seq_offset % BLOCK_SIZE) * stride_ks_slot
-                + kv_head_idx * stride_ks_head
-            )
-            k_token_head_scales = tl.load(
-                k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
-            )
-            v_scale_idx = (
-                physical_block_idx * stride_vs_blk
-                + (seq_offset % BLOCK_SIZE) * stride_vs_slot
-                + kv_head_idx * stride_vs_head
-            )
-            v_token_head_scales = tl.load(
-                v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
-            )
-
-        query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = compute_kv_seq_mask(
-            query_abs_pos,
-            seq_offset,
-            seq_idx,
-            seq_len,
-            mm_prefix_range_ptr,
-            SLIDING_WINDOW,
-            USE_MM_PREFIX,
-            MAX_MM_RANGES,
-            USE_CAUSAL,
-            USE_PER_SEQ_CAUSAL,
-            per_seq_causal_ptr,
-            rswa_prefix_lens_ptr,
-            R_SWA_WINDOW,
-            USE_R_SWA,
-            CHUNK_LOOKBACK,
-            CHUNK_SIZE,
-            MM_PREFIX_CLAMP_SW,
-        )
-
-        # S : (BLOCK_M, TILE_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
-            # Per-token-head quant: fuse softmax_scale with per-head k_scale
-            # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-            S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
-        else:
-            S += score_scale * tl.dot(Q, K)
-
-        if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
-
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
-
-        if USE_ALIBI_SLOPES:
-            S = apply_alibi_to_score(
-                S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
-            )
-
-        if USE_QQ_BIAS:
-            S += load_qq_bias_tile(
-                qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
-            )
-
-        M, L, P, alpha = softmax_step(S, M, L)
-        acc = acc * alpha[:, None]
-
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            dist = context_len + qpos_lo - seq_offset[:, None]
-            if USE_PER_SEQ_CAUSAL:
-                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
-                sw_mask_v = tl.where(
-                    is_causal_seq,
-                    dist < SLIDING_WINDOW,
-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+            if USE_R_SWA_ANCHORS:
+                rswa_anchor_bytes = tl.load(
+                    rswa_anchor_mask_ptr
+                    + seq_idx.to(tl.int64) * rswa_anchor_stride
+                    + seq_offset,
+                    mask=seq_offset < rswa_anchor_len,
+                    other=0,
                 )
-            elif USE_CAUSAL:
-                sw_mask_v = dist < SLIDING_WINDOW
+                rswa_gap_tile = rswa_gap_tile & (tl.max(rswa_anchor_bytes) == 0)
+            tile_visible = rswa_gap_tile == 0
+        if tile_visible:
+
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+
+            if USE_TD:
+                # All TILE_SIZE slots within a single KV tile map to one
+                # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
+                # from the static_assert above), so load the block index as
+                # a scalar instead of a broadcast reduction.
+                offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
+                physical_block_scalar = tl.load(
+                    block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
+                ).to(tl.int64)
+                # K : (HEAD_SIZE, TILE_SIZE)
+                K_load = _load_kv_tile_td(
+                    key_cache_ptr,
+                    physical_block_scalar,
+                    kv_head_idx,
+                    offset_in_block,
+                    stride_k_cache_0,
+                    stride_k_cache_1,
+                    stride_k_cache_2,
+                    stride_k_cache_3,
+                    BLOCK_SIZE,
+                    TILE_SIZE,
+                    HEAD_SIZE,
+                    HEAD_SIZE_PADDED,
+                ).T
+                # V : (TILE_SIZE, HEAD_SIZE)
+                V_load = _load_kv_tile_td(
+                    value_cache_ptr,
+                    physical_block_scalar,
+                    kv_head_idx,
+                    offset_in_block,
+                    stride_v_cache_0,
+                    stride_v_cache_1,
+                    stride_v_cache_2,
+                    stride_v_cache_3,
+                    BLOCK_SIZE,
+                    TILE_SIZE,
+                    HEAD_SIZE,
+                    HEAD_SIZE_PADDED,
+                )
             else:
-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
-            V = tl.where(sw_mask_v, V, 0.0)
-        if USE_PER_TOKEN_HEAD_SCALES:
-            # Per-token-head quant: apply v_scale to P instead of V.
-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+                v_offset = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + offs_d[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
+                k_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                # K : (HEAD_SIZE, TILE_SIZE)
+                K_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                # V : (TILE_SIZE, HEAD_SIZE)
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=dim_mask[None, :] & tile_mask[:, None],
+                    other=0.0,
+                )
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+
+            # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
+            if USE_PER_TOKEN_HEAD_SCALES:
+                scale_idx = (
+                    physical_block_idx * stride_ks_blk
+                    + (seq_offset % BLOCK_SIZE) * stride_ks_slot
+                    + kv_head_idx * stride_ks_head
+                )
+                k_token_head_scales = tl.load(
+                    k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
+                )
+                v_scale_idx = (
+                    physical_block_idx * stride_vs_blk
+                    + (seq_offset % BLOCK_SIZE) * stride_vs_slot
+                    + kv_head_idx * stride_vs_head
+                )
+                v_token_head_scales = tl.load(
+                    v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
+                )
+
+            query_abs_pos = context_len + query_pos[:, None]
+            seq_mask = compute_kv_seq_mask(
+                query_abs_pos,
+                seq_offset,
+                seq_idx,
+                seq_len,
+                mm_prefix_range_ptr,
+                SLIDING_WINDOW,
+                USE_MM_PREFIX,
+                MAX_MM_RANGES,
+                USE_CAUSAL,
+                USE_PER_SEQ_CAUSAL,
+                per_seq_causal_ptr,
+                rswa_prefix_lens_ptr,
+                R_SWA_WINDOW,
+                USE_R_SWA,
+                CHUNK_LOOKBACK,
+                CHUNK_SIZE,
+                MM_PREFIX_CLAMP_SW,
+                rswa_anchor_mask_ptr=rswa_anchor_mask_ptr,
+                rswa_anchor_stride=rswa_anchor_stride,
+                rswa_anchor_len=rswa_anchor_len,
+                USE_R_SWA_ANCHORS=USE_R_SWA_ANCHORS,
+                R_SWA_SINK=R_SWA_SINK,
+                R_SWA_STRIDE=R_SWA_STRIDE,
+            )
+
+            # S : (BLOCK_M, TILE_SIZE)
+            S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+            if USE_PER_TOKEN_HEAD_SCALES:
+                # Per-token-head quant: fuse softmax_scale with per-head k_scale
+                # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
+                S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
+            else:
+                S += score_scale * tl.dot(Q, K)
+
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap)
+
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+            )
+
+            if USE_ALIBI_SLOPES:
+                S = apply_alibi_to_score(
+                    S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
+                )
+
+            if USE_QQ_BIAS:
+                S += load_qq_bias_tile(
+                    qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
+                )
+
+            M, L, P, alpha = softmax_step(S, M, L)
+            acc = acc * alpha[:, None]
+
+            if SLIDING_WINDOW:
+                qpos_lo = q_block_local_idx * BLOCK_Q
+                dist = context_len + qpos_lo - seq_offset[:, None]
+                if USE_PER_SEQ_CAUSAL:
+                    is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+                    sw_mask_v = tl.where(
+                        is_causal_seq,
+                        dist < SLIDING_WINDOW,
+                        (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                    )
+                elif USE_CAUSAL:
+                    sw_mask_v = dist < SLIDING_WINDOW
+                else:
+                    sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+                V = tl.where(sw_mask_v, V, 0.0)
+            if USE_PER_TOKEN_HEAD_SCALES:
+                # Per-token-head quant: apply v_scale to P instead of V.
+                P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
+                acc += tl.dot(P_v, V)
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
 
     # ---- Epilogue ---------------------------------------------------------
     if IS_3D:
@@ -832,6 +875,11 @@ def unified_attention(
     # a fixed sliding window.
     rswa_prefix_lens=None,
     rswa_window: int | None = None,
+    # R-SWA visibility extensions (see rswa_anchor_tracker.py): per-seq live
+    # anchor byte mask [num_seqs, max_model_len], attention sinks, stride.
+    rswa_anchor_mask=None,
+    rswa_sink: int = 0,
+    rswa_stride: int = 0,
     use_alibi_sqrt=False,
     # KV cache quantization mode and per-token-head scale caches.
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
@@ -918,6 +966,7 @@ def unified_attention(
             )
 
     use_rswa = rswa_window is not None and rswa_prefix_lens is not None
+    use_rswa_anchors = use_rswa and rswa_anchor_mask is not None
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -1135,6 +1184,18 @@ def unified_attention(
         rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
         R_SWA_WINDOW=rswa_window or 0,
         USE_R_SWA=use_rswa,
+        rswa_anchor_mask_ptr=(
+            rswa_anchor_mask if use_rswa_anchors else seqused_k
+        ),
+        rswa_anchor_stride=(
+            rswa_anchor_mask.stride(0) if use_rswa_anchors else 0
+        ),
+        rswa_anchor_len=(
+            rswa_anchor_mask.shape[1] if use_rswa_anchors else 0
+        ),
+        USE_R_SWA_ANCHORS=use_rswa_anchors,
+        R_SWA_SINK=(rswa_sink or 0) if use_rswa else 0,
+        R_SWA_STRIDE=(rswa_stride or 0) if use_rswa else 0,
         stride_k_cache_0=k.stride(0),
         stride_k_cache_1=k.stride(1),
         stride_k_cache_2=k.stride(2),

@@ -25,7 +25,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention import Attention, RSWAAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -909,10 +909,31 @@ class GraniteForDoclingSharedMLP(nn.Module):
         return hidden_states
 
 
+
+def resolve_rswa_full_attn_layers(config) -> frozenset[int]:
+    """Decoder layers that keep full attention in a hybrid R-SWA stack.
+
+    The full-attention layer set must match the schedule the weights were
+    trained with. ``rswa_full_attn_layers`` (explicit index list) wins over
+    ``rswa_hybrid_period`` (every N-th layer, N>1).
+    """
+    num_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+    if num_layers <= 0:
+        return frozenset()
+    explicit = getattr(config, "rswa_full_attn_layers", None)
+    if explicit:
+        return frozenset(int(i) % num_layers for i in explicit)
+    period = int(getattr(config, "rswa_hybrid_period", 0) or 0)
+    if period > 1:
+        return frozenset(i for i in range(num_layers) if (i + 1) % period == 0)
+    return frozenset()
+
+
 class GraniteForDoclingAttention(nn.Module):
     def __init__(
         self,
         config,
+        layer_idx: int = 0,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -961,15 +982,31 @@ class GraniteForDoclingAttention(nn.Module):
         else:
             self.rotary_emb = None
 
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.attention_multiplier,
-            num_kv_heads=self.num_key_value_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-        )
+        rswa_window = getattr(config, "rswa_window", None)
+        if rswa_window and layer_idx in resolve_rswa_full_attn_layers(config):
+            # Hybrid stack: this layer sees the whole sequence.
+            rswa_window = None
+        if rswa_window:
+            self.attn = RSWAAttention(
+                self.num_heads,
+                self.head_dim,
+                self.attention_multiplier,
+                num_kv_heads=self.num_key_value_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+                rswa_window=rswa_window,
+            )
+        else:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.attention_multiplier,
+                num_kv_heads=self.num_key_value_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+            )
 
     def forward(
         self,
@@ -997,6 +1034,7 @@ class GraniteForDoclingDecoderLayer(nn.Module):
     def __init__(
         self,
         config,
+        layer_idx: int = 0,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -1005,6 +1043,7 @@ class GraniteForDoclingDecoderLayer(nn.Module):
         self.residual_multiplier = getattr(config, "residual_multiplier", 1.0)
         self.self_attn = GraniteForDoclingAttention(
             config,
+            layer_idx=layer_idx,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -1069,8 +1108,10 @@ class GraniteForDoclingTextModel(nn.Module):
         )
 
         def get_layer(prefix: str):
+            layer_idx = int(prefix.rsplit(".", 1)[1])
             return GraniteForDoclingDecoderLayer(
                 config,
+                layer_idx=layer_idx,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,

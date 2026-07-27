@@ -470,6 +470,12 @@ class CommonAttentionMetadata:
     fixed sliding window. None disables R-SWA. The attention backend copies this
     into its own persistent buffer and reads ``rswa_window`` from model config."""
 
+    rswa_anchor_mask: torch.Tensor | None = None
+    """(batch_size, max_model_len) uint8 device tensor of live DocLang
+    grammar-anchor positions for R-SWA decode (1 = visible past the window).
+    Owned/persisted by the model runner (rows ordered by batch slot); None
+    when grammar-anchor decode is disabled."""
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -581,6 +587,7 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
+            rswa_anchor_mask=maybe_slice_reqs(self.rswa_anchor_mask),
         )
 
 

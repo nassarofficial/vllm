@@ -587,6 +587,7 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         processed_computed_tokens: int,
         num_prompt_tokens: int | None = None,
+        token_ids=None,
     ) -> None:
         """
         Remove and free the blocks that are no longer needed for attention computation.
@@ -802,12 +803,143 @@ class RSWAManager(FullAttentionManager):
     def __init__(self, kv_cache_spec: RSWASpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.rswa_window: int = kv_cache_spec.rswa_window
+        # Safety margin for eviction (RSWA_EVICT_GRACE tokens, default 0):
+        # widens the keep region below the window so in-flight attention
+        # views built a step earlier (async scheduling) can never read a
+        # block freed in the same pipeline window. Race probe/fix for the
+        # eviction-era quality regression.
+        import os as _os
+
+        # batch-composition numerics floor). Cost: ~16 extra resident blocks
+        # per request — negligible vs the 1-2k-token prefix.
+        self.rswa_evict_grace: int = int(_os.environ.get("RSWA_EVICT_GRACE", 256))
+        # Deferred free (RSWA_DEFERRED_FREE steps, default 2): freed blocks
+        # are nulled in req_to_blocks immediately (invisible to all future
+        # metadata builds) but returned to the pool only after N further
+        # remove_skipped_blocks rounds — an in-flight attention view built
+        # one pipeline step earlier can therefore never read a reallocated
+        # block. Temporal fix for the free-reuse race that the positional
+        # grace margin only approximates.
+        self.rswa_deferred_free_steps: int = int(
+            _os.environ.get("RSWA_DEFERRED_FREE", 2)
+        )
+        self._deferred_free: list[list[KVCacheBlock]] = []
+        self.rswa_no_evict: bool = getattr(kv_cache_spec, "rswa_no_evict", False)
+        self.rswa_sink: int = getattr(kv_cache_spec, "rswa_sink", 0)
+        self.rswa_anchor_evict: bool = getattr(
+            kv_cache_spec, "rswa_anchor_evict", False
+        )
+        self._rswa_model_path: str = getattr(kv_cache_spec, "rswa_model_path", "")
+        self._anchor_keep_all_locs: bool = getattr(
+            kv_cache_spec, "rswa_keep_all_locs", False
+        )
+        self._anchor_closed_trail_k: int = getattr(
+            kv_cache_spec, "rswa_closed_trail_k", 0
+        )
+        # Scheduler-side DocLang trackers for anchor-selective eviction:
+        # request_id -> [tracker, live_anchor_positions, next_untracked_pos].
+        self._anchor_state: dict[str, list] = {}
+        self._anchor_tag_ids = None
+
+    def _get_anchor_tag_ids(self):
+        if self._anchor_tag_ids is None:
+            from transformers import AutoTokenizer
+
+            from vllm.v1.worker.rswa_anchor_tracker import DocLangTagIds
+
+            tokenizer = AutoTokenizer.from_pretrained(self._rswa_model_path)
+            self._anchor_tag_ids = DocLangTagIds.from_tokenizer(tokenizer)
+        return self._anchor_tag_ids
+
+    def _live_anchor_blocks(
+        self,
+        request_id: str,
+        token_ids,
+        num_prompt_tokens: int,
+        upto: int,
+    ) -> set[int]:
+        """Advance this request's DocLang tracker and return live anchor blocks."""
+        from vllm.v1.worker.rswa_anchor_tracker import DocLangAnchorTracker
+
+        state = self._anchor_state.get(request_id)
+        if state is not None and state[2] > min(upto, len(token_ids)):
+            # Preemption-recompute rewound the request: the tracker's live-set
+            # is stale (positions from the pre-preemption pass). Without this
+            # reset the keep-set is wrong and live-anchor blocks get evicted —
+            # the worker-side view then reads freed/reused memory (garbage
+            # attention: premature EOS or runaway outputs). Mirror the worker
+            # engine's reset-and-replay.
+            state = None
+        if state is None:
+            # Must mirror the worker engine's tracker construction
+            # (gpu_model_runner -> RswaAnchorEngine): with keep_all_locs or
+            # closed_trail_k set, the worker keeps anchors this tracker would
+            # not, and the manager would evict live KV.
+            tracker = DocLangAnchorTracker(
+                self._get_anchor_tag_ids(),
+                start_pos=num_prompt_tokens,
+                keep_all_locs=self._anchor_keep_all_locs,
+                closed_trail_k=self._anchor_closed_trail_k,
+            )
+            state = [tracker, set(), num_prompt_tokens]
+            self._anchor_state[request_id] = state
+        tracker, live, pos = state
+        end = min(upto, len(token_ids))
+        while pos < end:
+            births, deaths = tracker.step(token_ids[pos])
+            live.update(births)
+            live.difference_update(deaths)
+            pos += 1
+        state[2] = pos
+        bs = self.block_size
+        return {p // bs for p in live}
+
+    def free(self, request_id: str) -> None:
+        self._anchor_state.pop(request_id, None)
+        super().free(request_id)
+
+    def _remove_blocks_in_range_except(
+        self,
+        request_id: str,
+        first_block: int,
+        last_block: int,
+        keep_blocks: set[int],
+    ) -> None:
+        """Free non-kept blocks in ``[first_block, last_block)``.
+
+        Unlike ``_remove_blocks_in_range`` this cannot early-exit at the first
+        null block: kept anchor blocks leave non-contiguous null patterns, and
+        an anchor's death later makes a previously-kept block evictable.
+        """
+        if request_id not in self.req_to_blocks:
+            return
+        blocks = self.req_to_blocks[request_id]
+        last_block = min(last_block, len(blocks))
+        if first_block >= last_block:
+            return
+        freed: list[KVCacheBlock] = []
+        for i in range(last_block - 1, first_block - 1, -1):
+            if blocks[i] == self._null_block or i in keep_blocks:
+                continue
+            freed.append(blocks[i])
+            blocks[i] = self._null_block
+        if freed:
+            self._free_deferred(freed)
+
+    def _free_deferred(self, freed: list[KVCacheBlock]) -> None:
+        if self.rswa_deferred_free_steps <= 0:
+            self.block_pool.free_blocks(freed)
+            return
+        self._deferred_free.append(freed)
+        while len(self._deferred_free) > self.rswa_deferred_free_steps:
+            self.block_pool.free_blocks(self._deferred_free.pop(0))
 
     def remove_skipped_blocks(
         self,
         request_id: str,
         processed_computed_tokens: int,
         num_prompt_tokens: int | None = None,
+        token_ids=None,
     ) -> None:
         """Free gap blocks that are no longer needed for attention.
 
@@ -816,9 +948,19 @@ class RSWAManager(FullAttentionManager):
              max(prefix_len, processed_computed_tokens - rswa_window))
 
         Freed blocks are replaced with null_block in req_to_blocks so the
-        block_table passed to FA4 is valid (null_block KV is all-zero;
-        rswa_mask_mod marks gap positions as non-visible so FA4 skips them).
+        block_table passed to the attention backend is valid (null_block KV is
+        all-zero; the R-SWA mask marks gap positions non-visible).
+
+        With ``rswa_anchor_evict`` (block-compacted RSWAG), gap blocks that
+        contain live grammar anchors are kept resident and everything else in
+        the gap is freed — bounding KV at O(prefix + window + anchors) instead
+        of the blanket-no-evict O(sequence).
         """
+        if self.rswa_no_evict:
+            # Strided far past (or explicit rswa_blanket_no_evict) keeps
+            # arbitrary positions beyond the window visible; all KV stays
+            # resident (memory matches full attention).
+            return
         if num_prompt_tokens is None:
             super().remove_skipped_blocks(
                 request_id, processed_computed_tokens, num_prompt_tokens
@@ -826,13 +968,23 @@ class RSWAManager(FullAttentionManager):
             return
 
         bs = self.block_size
-        # First block fully after the prefill boundary.
-        first_gap_block = cdiv(num_prompt_tokens, bs)
+        # First block fully after the prefill boundary (plus the pinned
+        # attention-sink band when rswa_sink > 0).
+        first_gap_block = cdiv(num_prompt_tokens + self.rswa_sink, bs)
         # Decode window start position; blocks before this are evictable.
         window_start = max(
-            num_prompt_tokens, processed_computed_tokens - self.rswa_window
+            num_prompt_tokens,
+            processed_computed_tokens - self.rswa_window - self.rswa_evict_grace,
         )
         last_gap_block = window_start // bs  # exclusive upper bound
+        if self.rswa_anchor_evict and token_ids is not None:
+            keep = self._live_anchor_blocks(
+                request_id, token_ids, num_prompt_tokens, processed_computed_tokens
+            )
+            self._remove_blocks_in_range_except(
+                request_id, first_gap_block, last_gap_block, keep
+            )
+            return
         self._remove_blocks_in_range(request_id, first_gap_block, last_gap_block)
 
 
@@ -1371,6 +1523,7 @@ class MambaManager(SingleTypeKVCacheManager):
         request_id: str,
         processed_computed_tokens: int,
         num_prompt_tokens: int | None = None,
+        token_ids=None,
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 

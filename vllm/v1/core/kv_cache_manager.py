@@ -430,6 +430,7 @@ class KVCacheManager:
             request.request_id,
             max(0, total_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
+            token_ids=request.all_token_ids,
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
@@ -504,6 +505,7 @@ class KVCacheManager:
         request_id: str,
         processed_computed_tokens: int,
         num_prompt_tokens: int | None = None,
+        token_ids=None,
     ) -> None:
         """Remove the blocks that are no longer needed from `blocks` and replace
         the removed blocks with null_block.
@@ -515,7 +517,7 @@ class KVCacheManager:
             num_prompt_tokens: Optional prompt length for R-SWA gap eviction.
         """
         self.coordinator.remove_skipped_blocks(
-            request_id, processed_computed_tokens, num_prompt_tokens
+            request_id, processed_computed_tokens, num_prompt_tokens, token_ids=token_ids
         )
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:

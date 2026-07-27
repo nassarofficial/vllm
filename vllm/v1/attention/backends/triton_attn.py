@@ -96,6 +96,10 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    # R-SWA visibility extensions (see worker/rswa_anchor_tracker.py).
+    rswa_anchor_mask: torch.Tensor | None = None
+    rswa_sink: int = 0
+    rswa_stride: int = 0
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -173,7 +177,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             dtype=torch.float32,
             device=device,
         )
-        self.rswa_window = model_config.rswa_window
+        # Per-KV-cache-group, not per-model: hybrid stacks mix RSWASpec and
+        # FullAttentionSpec groups and only the former mask.
+        self.rswa_window = getattr(kv_cache_spec, "rswa_window", None)
         self.persistent_rswa_prefix_lens: torch.Tensor | None = None
         if self.rswa_window is not None:
             self.persistent_rswa_prefix_lens = torch.empty(
@@ -181,6 +187,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 dtype=torch.int32,
                 device=device,
             )
+        # R-SWA visibility extensions, read straight from the HF config so no
+        # model_arch plumbing is needed (all default-off).
+        _hf = getattr(model_config, "hf_config", None)
+        self.rswa_sink = int(getattr(_hf, "rswa_sink_tokens", 0) or 0)
+        self.rswa_stride = int(getattr(_hf, "rswa_stride", 0) or 0)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -264,6 +275,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             persistent_prefix_lens.copy_(rswa_prefix_lens[:num_reqs])
             attn_metadata.rswa_prefix_lens = persistent_prefix_lens
             attn_metadata.rswa_window = self.rswa_window
+            attn_metadata.rswa_sink = self.rswa_sink
+            attn_metadata.rswa_stride = self.rswa_stride
+            # Anchor mask: a persistent device buffer owned by the runner
+            # (rows already ordered by batch slot); pass through as-is.
+            attn_metadata.rswa_anchor_mask = (
+                common_attn_metadata.rswa_anchor_mask
+            )
 
         return attn_metadata
 
@@ -717,6 +735,9 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_range=mm_prefix_range_tensor,
             rswa_prefix_lens=attn_metadata.rswa_prefix_lens,
             rswa_window=attn_metadata.rswa_window,
+            rswa_anchor_mask=attn_metadata.rswa_anchor_mask,
+            rswa_sink=attn_metadata.rswa_sink,
+            rswa_stride=attn_metadata.rswa_stride,
             kv_quant_mode=self._kv_quant_mode,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,

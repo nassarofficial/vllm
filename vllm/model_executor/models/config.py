@@ -13,6 +13,25 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_RSWA_HYBRID_KNOBS = ("rswa_hybrid_period", "rswa_full_attn_layers")
+
+
+def _propagate_rswa_hybrid_knobs(hf_config) -> None:
+    """Copy hybrid-layer knobs onto ``text_config``.
+
+    The decoder reads its own ``text_config``, but the export writes the R-SWA
+    knobs at the top level next to ``rswa_window``. Without this the hybrid
+    setting is silently ignored and the model serves as a pure windowed stack.
+    Idempotent, so it is safe to call from both verify hooks.
+    """
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None:
+        return
+    for knob in _RSWA_HYBRID_KNOBS:
+        value = getattr(hf_config, knob, None)
+        if value is not None:
+            setattr(text_config, knob, value)
+
 
 class VerifyAndUpdateConfig:
     @staticmethod
@@ -75,7 +94,9 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
              → Triton unified attention with an R-SWA decode mask.
 
           4. ``--attention-config '{"backend": "auto"}'`` (or omitted)
-             → Auto-detect: FA4 if available (H20/H100 SM90), else TritonAttention.
+             → Auto-detect: FLASH_ATTN with FA3 two-pass R-SWA if FA2/FA3 is
+               1.1-4.5x full-attention throughput), else TritonAttention.
+               FA4 mask_mod requires an explicit ``flash_attn_version: 4``.
 
         Regardless of backend, prefix caching is disabled for this model: R-SWA
         decode-phase KV is not a pure causal function of the prefix (so decode
@@ -98,7 +119,7 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
         if attn_config.backend is None:
             attn_config.backend = (
                 AttentionBackendEnum.FLASH_ATTN
-                if fa4_available
+                if is_fa_version_supported(3) or is_fa_version_supported(2)
                 else AttentionBackendEnum.TRITON_ATTN
             )
             logger.info(
@@ -109,29 +130,36 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
 
         # ── step 2: configure the chosen backend ────────────────────────────
         if attn_config.backend == AttentionBackendEnum.FLASH_ATTN:
-            if not fa4_available:
-                raise RuntimeError(
-                    "Unlimited-OCR: --attention-config backend=FLASH_ATTN "
-                    "requires FA4 (rswa_mask_mod), but FA4 is not available on "
-                    "this device/installation. Use backend=TRITON_ATTN or "
-                    "FLEX_ATTENTION, or upgrade vllm-flash-attn."
-                )
-            # On SM90 (H20), the default FA version is FA3 regardless of FA4
-            # availability (FA4 is only auto-upgraded when head_size > 256).
-            # The R-SWA mask_mod requires FA4, so force the version globally.
+            # On SM90 (H20/H100), the default FA version is FA3.  FA4 gets the
+            # exact token-level rswa_mask_mod; FA2/FA3 run R-SWA via the
+            # two-pass prefix+window LSE merge in the FLASH_ATTN backend
+            # (block-granular prefix boundary; see FlashAttentionMetadata).
+            # Triton reference; 1.1-4.5x full-attention throughput). FA4
+            # mask_mod must be requested explicitly via flash_attn_version=4:
+            # is_fa_version_supported(4) can be true while the cute-DSL JIT is
+            # broken at runtime.
             if attn_config.flash_attn_version is None:
-                attn_config.flash_attn_version = 4
-            elif attn_config.flash_attn_version < 4:
-                logger.warning(
-                    "Unlimited-OCR: flash_attn_version=%d cannot express the "
-                    "R-SWA mask_mod; upgrading to 4.",
-                    attn_config.flash_attn_version,
+                attn_config.flash_attn_version = (
+                    3 if is_fa_version_supported(3) else 2
                 )
-                attn_config.flash_attn_version = 4
-            logger.info(
-                "Unlimited-OCR: FlashAttention FA%d + rswa_mask_mod — exact R-SWA.",
-                attn_config.flash_attn_version,
-            )
+            if attn_config.flash_attn_version == 4:
+                if not fa4_available:
+                    raise RuntimeError(
+                        "Unlimited-OCR: flash_attn_version=4 requested but FA4 "
+                        "is not available on this device/installation. Use "
+                        "flash_attn_version=3/2 (two-pass R-SWA), or "
+                        "backend=TRITON_ATTN / FLEX_ATTENTION."
+                    )
+                logger.info(
+                    "Unlimited-OCR: FlashAttention FA4 + rswa_mask_mod — "
+                    "exact token-level R-SWA."
+                )
+            else:
+                logger.info(
+                    "Unlimited-OCR: FlashAttention FA%s — R-SWA via two-pass "
+                    "prefix+window LSE merge.",
+                    attn_config.flash_attn_version or "2/3 (auto)",
+                )
 
         elif attn_config.backend == AttentionBackendEnum.TRITON_ATTN:
             logger.info(
@@ -153,6 +181,24 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
                 f"Unlimited-OCR: unsupported attention backend "
                 f"{attn_config.backend!r} for R-SWA. "
                 "Use FLASH_ATTN (FA4), TRITON_ATTN or FLEX_ATTENTION."
+            )
+
+        from vllm.model_executor.models.granitemoehybrid import (
+            resolve_rswa_full_attn_layers,
+        )
+
+        _propagate_rswa_hybrid_knobs(vllm_config.model_config.hf_config)
+        text_cfg = getattr(
+            vllm_config.model_config.hf_config, "text_config", None
+        ) or vllm_config.model_config.hf_config
+        full_layers = resolve_rswa_full_attn_layers(text_cfg)
+        if full_layers:
+            logger.info(
+                "Unlimited-OCR: hybrid R-SWA — layers %s keep full attention "
+                "(%d/%d); their KV is never evicted.",
+                sorted(full_layers),
+                len(full_layers),
+                len(text_cfg.layer_types),
             )
 
         # R-SWA windows the *generated* tokens, so a decode-token's KV is not a
@@ -193,6 +239,98 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
         # init_vllm_registered_model) can read it and create RSWAAttention.
         rswa_window = model_config.hf_config.rswa_window
         text_config.rswa_window = rswa_window
+        _propagate_rswa_hybrid_knobs(model_config.hf_config)
+
+
+class GraniteForDoclingConfig(VerifyAndUpdateConfig):
+    """R-SWA setup for GraniteForDocling; reuses Unlimited-OCR path."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        hf_config = vllm_config.model_config.hf_config
+        rswa_window = getattr(hf_config, "rswa_window", None)
+        if not rswa_window:
+            return
+        if getattr(hf_config, "rswa_anchor_mode", "none") == "grammar":
+            if getattr(hf_config, "rswa_decode_anchors", "none") == "grammar":
+                logger.info(
+                    "GraniteForDocling: decode-side grammar anchors "
+                    "ENABLED (rswa_decode_anchors=grammar; "
+                    "keep_all_locs=%s, closed_trail_k=%s).",
+                    getattr(hf_config, "rswa_keep_all_locs", False),
+                    getattr(hf_config, "rswa_closed_trail_k", 0),
+                )
+            else:
+                logger.warning(
+                    "GraniteForDocling: checkpoint was trained with grammar "
+                    "anchors (rswa_anchor_mode=grammar) but decode-side "
+                    "anchors are OFF (set rswa_decode_anchors='grammar' in the "
+                    "HF config to enable); masks implement prefix+window only."
+                )
+        logger.info(
+            "GraniteForDocling: R-SWA enabled (rswa_window=%d).", rswa_window
+        )
+        # Default Triton over FA4; FA4 cute-DSL JIT can fail at engine init.
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if vllm_config.attention_config.backend is None:
+            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+            logger.info(
+                "GraniteForDocling: defaulting R-SWA attention backend to "
+                "TRITON_ATTN."
+            )
+        UnlimitedOCRForCausalLMConfig.verify_and_update_config(vllm_config)
+
+        # Decode-side grammar anchors (RSWAG) run on TRITON_ATTN (exact,
+        # per-token) and on the FLASH_ATTN FA3/FA4 path (call C for FA3:
+        # block-granular — whole anchor-bearing gap blocks stay visible, a
+        # superset of the exact mask; FA4 gets rswa_mask_mod's exact version).
+        # keep_all_locs / closed_trail_k shape the anchor mask engine-side.
+        # Sinks and stride remain Triton-only. FA2 cannot run call C — a
+        # reproducible illegal-instruction fault at concurrency (isolated to
+        # FA2's own kernel via an FA3 control at the same scale; flash_attn.py
+        # degrades to prefix+window-only there, matching this same pattern.
+        triton_only = {
+            "rswa_sink_tokens": bool(getattr(hf_config, "rswa_sink_tokens", 0)),
+            "rswa_stride": bool(getattr(hf_config, "rswa_stride", 0)),
+        }
+        if (
+            any(triton_only.values())
+            and vllm_config.attention_config.backend != AttentionBackendEnum.TRITON_ATTN
+        ):
+            logger.warning(
+                "GraniteForDocling: R-SWA mask extensions %s are only "
+                "applied by the TRITON_ATTN backend; backend %s will ignore "
+                "them.",
+                [k for k, v in triton_only.items() if v],
+                vllm_config.attention_config.backend,
+            )
+        if getattr(hf_config, "rswa_decode_anchors", "none") == "grammar":
+            if (
+                vllm_config.attention_config.backend == AttentionBackendEnum.FLASH_ATTN
+                and vllm_config.attention_config.flash_attn_version == 2
+            ):
+                logger.warning(
+                    "GraniteForDocling: RSWAG decode anchors are not "
+                    "supported on FLASH_ATTN with flash_attn_version=2 (call "
+                    "C is unstable on FA2 at concurrency); serving "
+                    "prefix+window only. Use flash_attn_version=3/4 for "
+                    "anchors on the FLASH_ATTN backend."
+                )
+            elif vllm_config.attention_config.backend == AttentionBackendEnum.FLASH_ATTN:
+                logger.info(
+                    "GraniteForDocling: RSWAG decode anchors on FLASH_ATTN "
+                    "via block-granular anchor pass (call C, triple LSE merge)."
+                )
+
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        hf_config = model_config.hf_config
+        rswa_window = getattr(hf_config, "rswa_window", None)
+        if not rswa_window:
+            return
+        hf_config.text_config.rswa_window = rswa_window
+        _propagate_rswa_hybrid_knobs(hf_config)
 
 
 class Gemma4Config(VerifyAndUpdateConfig):
@@ -839,6 +977,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4ForConditionalGeneration": Gemma4Config,
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
+    "GraniteForDoclingForConditionalGeneration": GraniteForDoclingConfig,
     "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,
