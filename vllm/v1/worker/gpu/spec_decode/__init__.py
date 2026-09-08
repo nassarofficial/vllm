@@ -27,6 +27,12 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
 
         return Gemma4Speculator(vllm_config, device)
     elif speculative_config.method == "mtp":
+        if speculative_config.use_granite_docling_mtp():
+            from vllm.v1.worker.gpu.spec_decode.granite_docling_mtp.speculator import (
+                GraniteDoclingMTPSpeculator,
+            )
+
+            return GraniteDoclingMTPSpeculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
         return MTPSpeculator(vllm_config, device)

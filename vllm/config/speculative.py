@@ -872,6 +872,15 @@ class SpeculativeConfig:
                         )
                 elif self.method == "draft_model":
                     pass
+                elif self.method == "mtp" and (
+                    int(getattr(self.draft_model_config.hf_config, "num_mtp_layers", 0))
+                    or int(
+                        getattr(self.target_model_config.hf_config, "num_mtp_layers", 0)
+                    )
+                ):
+                    # GraniteForDocling: MTP heads live on the target checkpoint.
+                    # Do not rewrite architectures to a separate draft class.
+                    pass
                 else:
                     raise NotImplementedError(
                         f"Unsupported speculative method: '{self.method}'"
@@ -922,6 +931,10 @@ class SpeculativeConfig:
                 n_predict = getattr(
                     self.draft_model_config.hf_config, "n_predict", None
                 )
+                if n_predict is None:
+                    n_predict = getattr(
+                        self.draft_model_config.hf_config, "num_mtp_layers", None
+                    )
                 if n_predict is not None:
                     if self.num_speculative_tokens is None:
                         # Default to max value defined in draft model config.
@@ -1245,6 +1258,13 @@ class SpeculativeConfig:
             # Since we do not slice the draft tokens
             slots_per_req += 1
         return slots_per_req
+
+    def use_granite_docling_mtp(self) -> bool:
+        """MTP heads live on GraniteForDocling when ``num_mtp_layers`` is set."""
+        target = self.target_model_config
+        if self.method != "mtp" or target is None:
+            return False
+        return int(getattr(target.hf_config, "num_mtp_layers", 0)) > 0
 
     def use_gemma4_mtp(self) -> bool:
         return (

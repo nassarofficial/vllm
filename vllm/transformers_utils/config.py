@@ -128,7 +128,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     **{"unlimited-ocr": "UnlimitedOCRConfig"},
 )
 
-_SPECULATIVE_DECODING_CONFIGS: set[str] = {"eagle", "speculators", "medusa"}
+_SPECULATIVE_DECODING_CONFIGS: set[str] = {"eagle", "speculators", "medusa", "mtp"}
 
 _PATCH_HF_VALIDATE_ROPE: set[str] = {"sarvam_mla"}
 
