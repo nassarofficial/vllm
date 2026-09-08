@@ -898,6 +898,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         is_available_online=False,
     ),
     "GraniteVision": _HfExamplesInfo("ibm-granite/granite-vision-3.3-2b"),
+    "GraniteForDoclingForConditionalGeneration": _HfExamplesInfo(
+        "docling-project/granite-for-docling-500m",
+        is_available_online=False,
+    ),
     "GraniteSpeechForConditionalGeneration": _HfExamplesInfo(
         "ibm-granite/granite-speech-3.3-2b",
         extras={"4.0-1b": "ibm-granite/granite-4.0-1b-speech"},
