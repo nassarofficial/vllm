@@ -150,9 +150,7 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
             # is_fa_version_supported(4) can be true while the cute-DSL JIT is
             # broken at runtime.
             if attn_config.flash_attn_version is None:
-                attn_config.flash_attn_version = (
-                    3 if is_fa_version_supported(3) else 2
-                )
+                attn_config.flash_attn_version = 3 if is_fa_version_supported(3) else 2
             if attn_config.flash_attn_version == 4:
                 if not fa4_available:
                     raise RuntimeError(
@@ -199,9 +197,10 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
         )
 
         _propagate_rswa_hybrid_knobs(vllm_config.model_config.hf_config)
-        text_cfg = getattr(
-            vllm_config.model_config.hf_config, "text_config", None
-        ) or vllm_config.model_config.hf_config
+        text_cfg = (
+            getattr(vllm_config.model_config.hf_config, "text_config", None)
+            or vllm_config.model_config.hf_config
+        )
         full_layers = resolve_rswa_full_attn_layers(text_cfg)
         if full_layers:
             n_layers = int(getattr(text_cfg, "num_hidden_layers", 0) or 0)
@@ -281,17 +280,14 @@ class GraniteForDoclingConfig(VerifyAndUpdateConfig):
                     "anchors are OFF (set rswa_decode_anchors='grammar' in the "
                     "HF config to enable); masks implement prefix+window only."
                 )
-        logger.info(
-            "GraniteForDocling: R-SWA enabled (rswa_window=%d).", rswa_window
-        )
+        logger.info("GraniteForDocling: R-SWA enabled (rswa_window=%d).", rswa_window)
         # Default Triton over FA4; FA4 cute-DSL JIT can fail at engine init.
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         if vllm_config.attention_config.backend is None:
             vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
             logger.info(
-                "GraniteForDocling: defaulting R-SWA attention backend to "
-                "TRITON_ATTN."
+                "GraniteForDocling: defaulting R-SWA attention backend to TRITON_ATTN."
             )
         UnlimitedOCRForCausalLMConfig.verify_and_update_config(vllm_config)
 
@@ -331,7 +327,9 @@ class GraniteForDoclingConfig(VerifyAndUpdateConfig):
                     "prefix+window only. Use flash_attn_version=3/4 for "
                     "anchors on the FLASH_ATTN backend."
                 )
-            elif vllm_config.attention_config.backend == AttentionBackendEnum.FLASH_ATTN:
+            elif (
+                vllm_config.attention_config.backend == AttentionBackendEnum.FLASH_ATTN
+            ):
                 logger.info(
                     "GraniteForDocling: RSWAG decode anchors on FLASH_ATTN "
                     "via block-granular anchor pass (call C, triple LSE merge)."

@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import os
 import threading
 import time
 from collections import defaultdict
@@ -716,9 +715,7 @@ class GPUModelRunner(
             self.rswa_anchor_engine = RswaAnchorEngine(
                 self.model_config.model,
                 self.max_model_len,
-                keep_all_locs=bool(
-                    getattr(_rswa_hf_cfg, "rswa_keep_all_locs", False)
-                ),
+                keep_all_locs=bool(getattr(_rswa_hf_cfg, "rswa_keep_all_locs", False)),
                 closed_trail_k=int(
                     getattr(_rswa_hf_cfg, "rswa_closed_trail_k", 0) or 0
                 ),

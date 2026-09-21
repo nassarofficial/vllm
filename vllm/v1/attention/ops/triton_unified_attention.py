@@ -462,7 +462,6 @@ def kernel_unified_attention(
                 rswa_gap_tile = rswa_gap_tile & (tl.max(rswa_anchor_bytes) == 0)
             tile_visible = rswa_gap_tile == 0
         if tile_visible:
-
             physical_block_idx = tl.load(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
@@ -474,7 +473,9 @@ def kernel_unified_attention(
                 # a scalar instead of a broadcast reduction.
                 offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
                 physical_block_scalar = tl.load(
-                    block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
+                    block_tables_ptr
+                    + block_table_offset
+                    + (j * TILE_SIZE) // BLOCK_SIZE
                 ).to(tl.int64)
                 # K : (HEAD_SIZE, TILE_SIZE)
                 K_load = _load_kv_tile_td(
@@ -593,7 +594,9 @@ def kernel_unified_attention(
                 S = apply_softcap(S, softcap)
 
             S = tl.where(
-                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+                S,
+                float("-inf"),
             )
 
             if USE_ALIBI_SLOPES:
@@ -1189,15 +1192,9 @@ def unified_attention(
         rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
         R_SWA_WINDOW=rswa_window or 0,
         USE_R_SWA=use_rswa,
-        rswa_anchor_mask_ptr=(
-            rswa_anchor_mask if use_rswa_anchors else seqused_k
-        ),
-        rswa_anchor_stride=(
-            rswa_anchor_mask.stride(0) if use_rswa_anchors else 0
-        ),
-        rswa_anchor_len=(
-            rswa_anchor_mask.shape[1] if use_rswa_anchors else 0
-        ),
+        rswa_anchor_mask_ptr=(rswa_anchor_mask if use_rswa_anchors else seqused_k),
+        rswa_anchor_stride=(rswa_anchor_mask.stride(0) if use_rswa_anchors else 0),
+        rswa_anchor_len=(rswa_anchor_mask.shape[1] if use_rswa_anchors else 0),
         USE_R_SWA_ANCHORS=use_rswa_anchors,
         R_SWA_SINK=(rswa_sink or 0) if use_rswa else 0,
         R_SWA_STRIDE=(rswa_stride or 0) if use_rswa else 0,
