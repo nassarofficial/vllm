@@ -440,6 +440,8 @@ class KVCacheCoordinator(ABC):
             num_prompt_tokens: Optional prompt length. R-SWA managers use this to
                 free gap blocks between the prefill tail and decode window; other
                 manager types ignore it.
+            token_ids: Optional token ids of the request. R-SWA managers with grammar
+                anchors use them to keep anchor blocks; other manager types ignore it.
 
         """
         for manager in self.single_type_managers:

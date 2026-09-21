@@ -87,13 +87,12 @@ logger = init_logger(__name__)
 
 
 class GraniteForDoclingImagePixelInputs(TensorSchema):
-    """
-    Dimensions:
-        - bnp: Batch size * number of images * number of tiles
-        - c: Number of channels (3)
-        - h: Height
-        - w: Width
-        - bn: Batch size * number of images
+    """Dimensions:
+    - bnp: Batch size * number of images * number of tiles
+    - c: Number of channels (3)
+    - h: Height
+    - w: Width
+    - bn: Batch size * number of images
     """
 
     type: Literal["pixel_values"]
@@ -103,11 +102,10 @@ class GraniteForDoclingImagePixelInputs(TensorSchema):
 
 
 class GraniteForDoclingImageEmbeddingInputs(TensorSchema):
-    """
-    Dimensions:
-        - bn: Batch size * number of images
-        - f: Image feature size
-        - h: Hidden size of the language model * ``1 + num_deepstack_levels``
+    """Dimensions:
+    - bn: Batch size * number of images
+    - f: Image feature size
+    - h: Hidden size of the language model * ``1 + num_deepstack_levels``
     """
 
     type: Literal["image_embeds"]
