@@ -223,39 +223,33 @@ class GraniteForDoclingDummyInputsBuilder(
 class GraniteForDoclingMultiModalProcessor(
     BaseMultiModalProcessor[GraniteForDoclingProcessingInfo]
 ):
-    def _call_hf_processor(
+    def _postprocess_hf_mm_data(
         self,
-        prompt: str,
         mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
     ) -> BatchFeature:
-        # Text-only input: go straight to the tokenizer
         if not (images := mm_data.get("images", [])):
-            prompt_ids = self.info.get_tokenizer().encode(prompt)
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
-
-        processed_outputs = super()._call_hf_processor(
-            prompt, mm_data, mm_kwargs, tok_kwargs
-        )
+            return processed_data
 
         # One prompt is one sample: ``(1, num_tiles, C, H, W)`` without padding tiles
-        pixel_values = processed_outputs["pixel_values"].flatten(0, 1)
-        processed_outputs["pixel_values"] = pixel_values
-        tile_fine_mask = processed_outputs.get("tile_fine_mask")
-        processed_outputs["tile_fine_mask"] = (
+        pixel_values = processed_data["pixel_values"].flatten(0, 1)
+        processed_data["pixel_values"] = pixel_values
+        tile_fine_mask = processed_data.get("tile_fine_mask")
+        processed_data["tile_fine_mask"] = (
             tile_fine_mask.flatten()
             if tile_fine_mask is not None
             else torch.zeros(pixel_values.shape[0], dtype=torch.bool)
         )
 
-        image_processor = self.info.get_hf_processor(**mm_kwargs).image_processor
-        image_kwargs = self.info.get_image_kwargs(mm_kwargs)
+        image_processor = self.info.get_hf_processor(
+            **hf_processor_mm_kwargs
+        ).image_processor
+        image_kwargs = self.info.get_image_kwargs(hf_processor_mm_kwargs)
         parsed_images = self.info.parse_mm_data(
             {"image": images}, validate=False
         ).get_items("image", ImageProcessorItems)
-        processed_outputs["num_patches"] = torch.tensor(
+        processed_data["num_patches"] = torch.tensor(
             [
                 image_processor.get_number_of_image_patches(
                     image_size.height, image_size.width, image_kwargs
@@ -265,7 +259,7 @@ class GraniteForDoclingMultiModalProcessor(
                 )
             ]
         )
-        return processed_outputs
+        return processed_data
 
     def _get_mm_fields_config(
         self,
