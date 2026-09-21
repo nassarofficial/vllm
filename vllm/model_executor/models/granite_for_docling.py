@@ -136,7 +136,15 @@ class GraniteForDoclingProcessingInfo(BaseProcessingInfo):
 
     def get_image_kwargs(self, mm_kwargs: Mapping[str, object]) -> dict[str, object]:
         """Per-request kwargs merged with the model's ``mm_processor_kwargs``."""
-        return self.ctx.get_merged_mm_kwargs(mm_kwargs)
+        image_kwargs = self.ctx.get_merged_mm_kwargs(mm_kwargs)
+        if image_kwargs.get("fine_route", False) and not getattr(
+            self.get_hf_config(), "use_fine_route", True
+        ):
+            raise ValueError(
+                "This model has no fine connector path (`config.use_fine_route=False`); "
+                "`fine_route=True` is not supported."
+            )
+        return image_kwargs
 
     def get_image_seq_len(
         self,
@@ -567,12 +575,18 @@ class GraniteForDoclingConnector(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "modality_projection"),
         )
-        self.proj_fine = ReplicatedLinear(
-            vision_hidden_size * (self.fine_scale_factor**2),
-            text_hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "proj_fine"),
+        # Checkpoints trained with the coarse path only set ``use_fine_route=False``.
+        self.use_fine_route = getattr(config, "use_fine_route", True)
+        self.proj_fine = (
+            ReplicatedLinear(
+                vision_hidden_size * (self.fine_scale_factor**2),
+                text_hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "proj_fine"),
+            )
+            if self.use_fine_route
+            else None
         )
         self.ln_mid = nn.LayerNorm(text_hidden_size)
         self.mlp_fc2 = ReplicatedLinear(
@@ -590,13 +604,14 @@ class GraniteForDoclingConnector(nn.Module):
             ),
             persistent=False,
         )
-        self.register_buffer(
-            "pos_embed_2d_fine",
-            _build_2d_sincos_pos_embed(
-                text_hidden_size, grid_size // self.fine_scale_factor
-            ),
-            persistent=False,
-        )
+        if self.use_fine_route:
+            self.register_buffer(
+                "pos_embed_2d_fine",
+                _build_2d_sincos_pos_embed(
+                    text_hidden_size, grid_size // self.fine_scale_factor
+                ),
+                persistent=False,
+            )
         self.deepstack_mergers = nn.ModuleList(
             [
                 GraniteForDoclingDeepStackMerger(
@@ -609,17 +624,21 @@ class GraniteForDoclingConnector(nn.Module):
                 for slot in range(len(config.deepstack_visual_indexes))
             ]
         )
-        self.deepstack_mergers_fine = nn.ModuleList(
-            [
-                GraniteForDoclingDeepStackMerger(
-                    vision_hidden_size,
-                    self.fine_scale_factor,
-                    text_hidden_size,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, f"deepstack_mergers_fine.{slot}"),
-                )
-                for slot in range(len(config.deepstack_visual_indexes))
-            ]
+        self.deepstack_mergers_fine = (
+            nn.ModuleList(
+                [
+                    GraniteForDoclingDeepStackMerger(
+                        vision_hidden_size,
+                        self.fine_scale_factor,
+                        text_hidden_size,
+                        quant_config=quant_config,
+                        prefix=maybe_prefix(prefix, f"deepstack_mergers_fine.{slot}"),
+                    )
+                    for slot in range(len(config.deepstack_visual_indexes))
+                ]
+            )
+            if self.use_fine_route
+            else None
         )
 
     def _pos_embed(self, name: str, x: torch.Tensor) -> torch.Tensor:
@@ -640,6 +659,10 @@ class GraniteForDoclingConnector(nn.Module):
         fine: bool,
     ) -> torch.Tensor:
         x = self.ln_in(image_hidden_states)
+        if fine and not self.use_fine_route:
+            raise ValueError(
+                "This model has no fine connector path (`config.use_fine_route=False`)."
+            )
         if fine:
             x, _ = self.proj_fine(_pixel_shuffle(x, self.fine_scale_factor))
             x = x + self._pos_embed("pos_embed_2d_fine", x)
@@ -1047,6 +1070,43 @@ class GraniteForDoclingTextModel(nn.Module):
 
 
 # -----------------------------------------------------------------------------
+# Density router
+# -----------------------------------------------------------------------------
+
+
+class GraniteForDoclingDensityRouter(nn.Module):
+    """Predicts from the vision features of a page's tiles whether the page needs
+    the fine connector path. Built when ``config.density_router_hidden_size`` is
+    set; parameters are laid out like the HF module."""
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        vision_hidden_size = config.vision_config.hidden_size
+        self.att = nn.Linear(vision_hidden_size, 1)
+        self.norm = nn.LayerNorm(vision_hidden_size)
+        self.fc1 = nn.Linear(vision_hidden_size, config.density_router_hidden_size)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(config.density_router_hidden_size, 1)
+
+    def forward(
+        self,
+        image_hidden_states: torch.Tensor,
+        tile_sample_index: torch.Tensor,
+        num_samples: int,
+    ) -> torch.Tensor:
+        # Attention-pool the patches of every tile, then average the tiles of a page.
+        weights = torch.softmax(self.att(image_hidden_states), dim=1)
+        tile_features = (image_hidden_states * weights).sum(dim=1)
+        sample_features = tile_features.new_zeros(num_samples, tile_features.shape[-1])
+        sample_features = sample_features.index_add(0, tile_sample_index, tile_features)
+        num_tiles = tile_features.new_zeros(num_samples).index_add(
+            0, tile_sample_index, tile_features.new_ones(tile_features.shape[0])
+        )
+        sample_features = sample_features / num_tiles.clamp(min=1).unsqueeze(-1)
+        return self.fc2(self.act(self.fc1(self.norm(sample_features)))).squeeze(-1)
+
+
+# -----------------------------------------------------------------------------
 # Composite model: vision + connector + text
 # -----------------------------------------------------------------------------
 
@@ -1077,6 +1137,14 @@ class GraniteForDoclingModel(nn.Module):
             prefix=maybe_prefix(prefix, "text_model"),
         )
         self.text_model.set_deepstack_attn_layers(config.deepstack_attn_layers)
+        # Optional modules are declared by the config, like in the HF model:
+        # ``density_router_hidden_size`` -> router, ``use_fine_route`` -> fine
+        # connector path, ``num_mtp_layers`` -> MTP heads (on the top-level model).
+        self.density_router = (
+            GraniteForDoclingDensityRouter(config)
+            if getattr(config, "density_router_hidden_size", None) is not None
+            else None
+        )
         self.image_seq_len = (
             config.vision_config.image_size // config.vision_config.patch_size
         ) ** 2 // config.scale_factor**2
@@ -1181,6 +1249,13 @@ class GraniteForDoclingForConditionalGeneration(
         )
         self.mtp = maybe_build_mtp(
             config, vllm_config, prefix=maybe_prefix(prefix, "mtp")
+        )
+        logger.info(
+            "GraniteForDocling checkpoint declares: fine route=%s, density router=%s, "
+            "MTP heads=%d",
+            getattr(config, "use_fine_route", True),
+            self.model.density_router is not None,
+            0 if self.mtp is None else self.mtp.num_heads,
         )
 
     def _parse_and_validate_image_input(self, **kwargs: object) -> ImageInputs | None:
@@ -1382,9 +1457,52 @@ class GraniteForDoclingForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    @torch.inference_mode()
+    def fine_route_probability(
+        self, pixel_values: torch.Tensor, num_tiles_per_image: Sequence[int]
+    ) -> torch.Tensor:
+        """Probability that each page needs the fine connector path.
+
+        ``pixel_values`` holds the tiles of all pages, ``(num_tiles, C, H, W)``, and
+        ``num_tiles_per_image`` how many of them belong to each page. Call it through
+        ``LLM.apply_model`` and resubmit the pages it selects with
+        ``mm_processor_kwargs={"fine_route": True}`` (the HF two-pass routing)."""
+        router = self.model.density_router
+        if router is None:
+            raise ValueError(
+                "This model has no density router "
+                "(`config.density_router_hidden_size` is not set)."
+            )
+        device = next(router.parameters()).device
+        last_hidden, _ = self.model.image_pixels_to_features(pixel_values.to(device))
+        num_tiles = torch.as_tensor(list(num_tiles_per_image), device=device)
+        tile_sample_index = torch.repeat_interleave(
+            torch.arange(num_tiles.numel(), device=device), num_tiles
+        )
+        logits = router(last_hidden, tile_sample_index, num_tiles.numel())
+        return torch.sigmoid(logits.float())
+
+    def predict_fine_route(
+        self, pixel_values: torch.Tensor, num_tiles_per_image: Sequence[int]
+    ) -> torch.Tensor:
+        """``True`` for the pages that need the fine connector path."""
+        probability = self.fine_route_probability(pixel_values, num_tiles_per_image)
+        return probability >= self.config.density_router_threshold
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # The density router only serves the two-pass routing API of the HF model.
-        loader = AutoWeightsLoader(self, skip_prefixes=["model.density_router."])
+        # Tensors of an optional module are skipped only when the config says the
+        # checkpoint does not have that module; a declared module must load.
+        skip_prefixes = []
+        if self.model.density_router is None:
+            skip_prefixes.append("model.density_router.")
+        if self.mtp is None:
+            skip_prefixes.append("mtp.")
+        if not getattr(self.config, "use_fine_route", True):
+            skip_prefixes += [
+                "model.connector.proj_fine.",
+                "model.connector.deepstack_mergers_fine.",
+            ]
+        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights)
 
     def get_language_model(self) -> nn.Module:
