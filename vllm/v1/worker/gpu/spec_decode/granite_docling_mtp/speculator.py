@@ -82,20 +82,16 @@ from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     init_attn_backend,
 )
-from vllm.v1.worker.gpu.cudagraph_utils import (
-    AttentionStatePair,
-    BatchExecutionDescriptor,
-    get_uniform_token_count,
-)
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
-    DecodeSpeculatorCudaGraphManager,
+    SpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
     prepare_prefill_inputs,
 )
+from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 logger = init_logger(__name__)
 
@@ -281,7 +277,18 @@ class GraniteDoclingMTPSpeculator(AutoRegressiveSpeculator):
 
     # ---- attention: draft-geometry metadata builders --------------------
 
-    def set_attn(self, model_state, kv_cache_config, block_tables) -> None:
+    def set_attn(
+        self,
+        model_state,
+        kv_cache_config,
+        block_tables,
+        target_input_buffers=None,
+        target_attn_groups=None,
+    ) -> None:
+        # The heads never reuse the target's attention metadata (their geometry
+        # differs), so the target buffers / groups are kept only for the base class.
+        self.target_input_buffers = target_input_buffers
+        self.target_attn_groups = target_attn_groups
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
         self.block_tables = block_tables
@@ -400,7 +407,7 @@ class GraniteDoclingMTPSpeculator(AutoRegressiveSpeculator):
         # every head runs over the same chunk with the same static buffers, and
         # the head index is a capture-time constant, so K graph launches (and
         # their inter-graph gaps) collapse into one.
-        self._manager = DecodeSpeculatorCudaGraphManager(
+        self._manager = SpeculatorCudaGraphManager(
             self.vllm_config, self.device, decode_mode, decode_query_len=k + 1
         )
         # Used for dispatch and by any base-class code expecting the attribute.
@@ -408,14 +415,12 @@ class GraniteDoclingMTPSpeculator(AutoRegressiveSpeculator):
         # Never single-step: every head runs over the full chunk.
         self.decode_cudagraph_manager = None
 
-    def capture(
-        self,
-        attn_states: dict[BatchExecutionDescriptor, AttentionStatePair],
-    ) -> None:
+    def capture(self) -> None:
         logger.info(
             "Capturing MTP speculator graphs (%d heads)...", self.num_speculative_steps
         )
         self.last_token_indices.zero_()
+        self.idx_mapping.zero_()
         mgr = self._manager
         if mgr.use_breakable_cg:
             mgr.init_breakable_cg_runner(self.model)
@@ -447,7 +452,7 @@ class GraniteDoclingMTPSpeculator(AutoRegressiveSpeculator):
         next_prefill_tokens: torch.Tensor,
         temperature: torch.Tensor,
         seeds: torch.Tensor,
-        num_tokens_across_dp: torch.Tensor | None = None,
+        dp_sync=None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
@@ -512,10 +517,10 @@ class GraniteDoclingMTPSpeculator(AutoRegressiveSpeculator):
             self.prefill_len_cpu[:num_reqs], non_blocking=True
         )
 
-        uniform_token_count = get_uniform_token_count(
-            num_reqs, input_batch.num_tokens, max_query_len
+        uniform_token_count = get_uniform_decode_token_count(
+            num_reqs, input_batch.num_tokens, max_query_len, input_batch.has_prefill
         )
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        batch_desc, batch_sync = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,
             num_reqs,
             num_tokens,
@@ -523,6 +528,10 @@ class GraniteDoclingMTPSpeculator(AutoRegressiveSpeculator):
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+            dp_sync=dp_sync,
+        )
+        num_tokens_across_dp = (
+            batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
         self._prepare_eplb_forward(input_batch.num_tokens)
 
