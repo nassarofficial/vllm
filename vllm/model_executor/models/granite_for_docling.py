@@ -1489,17 +1489,17 @@ class GraniteForDoclingForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Tensors of an optional module are skipped only when the config says the
         # checkpoint does not have that module; a declared module must load.
-        skip_prefixes = []
+        ignore_prefixes = []
         if self.model.density_router is None:
-            skip_prefixes.append("model.density_router.")
+            ignore_prefixes.append("model.density_router.")
         if self.mtp is None:
-            skip_prefixes.append("mtp.")
+            ignore_prefixes.append("mtp.")
         if not getattr(self.config, "use_fine_route", True):
-            skip_prefixes += [
+            ignore_prefixes += [
                 "model.connector.proj_fine.",
                 "model.connector.deepstack_mergers_fine.",
             ]
-        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+        loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=ignore_prefixes)
         return loader.load_weights(weights)
 
     def get_language_model(self) -> nn.Module:
