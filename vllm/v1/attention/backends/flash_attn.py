@@ -884,9 +884,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # Tail tokens of the (always-resident) last real block.
         tail = seq_lens.to(torch.int64) - (num_blocks - 1).clamp(min=0) * bs
         seqused = ((n_resident - 1).clamp(min=0) * bs + tail).clamp(min=1)
-        self.persistent_rswa_packed_seqused[:num_reqs].copy_(
-            seqused.to(torch.int32)
-        )
+        self.persistent_rswa_packed_seqused[:num_reqs].copy_(seqused.to(torch.int32))
         attn_metadata.rswa_packed_block_table = packed
         attn_metadata.rswa_packed_seqused = self.persistent_rswa_packed_seqused[
             :num_reqs
@@ -974,16 +972,16 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.persistent_rswa_b_valid_tokens[:num_actual_tokens].copy_(
                 b_valid_tokens[:num_actual_tokens], non_blocking=True
             )
-            self.persistent_rswa_b_offsets[:num_views].copy_(
-                off, non_blocking=True
-            )
+            self.persistent_rswa_b_offsets[:num_views].copy_(off, non_blocking=True)
             if (
                 self.persistent_rswa_b_block_table is None
                 or self.persistent_rswa_b_block_table.shape[1] < nb
             ):
                 max_num_reqs = self.persistent_rswa_seqused_a.shape[0]
                 self.persistent_rswa_b_block_table = torch.zeros(
-                    max_num_reqs, nb, dtype=block_table_tensor.dtype,
+                    max_num_reqs,
+                    nb,
+                    dtype=block_table_tensor.dtype,
                     device=self.device,
                 )
                 self._rswa_gather_idx = torch.zeros(
