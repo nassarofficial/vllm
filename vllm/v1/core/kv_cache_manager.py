@@ -637,7 +637,10 @@ class KVCacheManager:
 
         """
         self.coordinator.remove_skipped_blocks(
-            request_id, processed_computed_tokens, num_prompt_tokens, token_ids=token_ids
+            request_id,
+            processed_computed_tokens,
+            num_prompt_tokens,
+            token_ids=token_ids,
         )
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:

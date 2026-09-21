@@ -398,9 +398,7 @@ def compute_kv_seq_mask(
             # Strided far past: every R_SWA_STRIDE-th generated token stays
             # visible beyond the window (fuzzy global coverage).
             gen_off_s = seq_offset[None, :] - prefix_len
-            rswa_vis = rswa_vis | (
-                (gen_off_s >= 0) & (gen_off_s % R_SWA_STRIDE == 0)
-            )
+            rswa_vis = rswa_vis | ((gen_off_s >= 0) & (gen_off_s % R_SWA_STRIDE == 0))
         if USE_R_SWA_ANCHORS:
             # Live DocLang grammar anchors (per-seq byte mask over absolute
             # KV positions, maintained by RswaAnchorEngine in the runner).

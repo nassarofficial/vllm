@@ -279,9 +279,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             attn_metadata.rswa_stride = self.rswa_stride
             # Anchor mask: a persistent device buffer owned by the runner
             # (rows already ordered by batch slot); pass through as-is.
-            attn_metadata.rswa_anchor_mask = (
-                common_attn_metadata.rswa_anchor_mask
-            )
+            attn_metadata.rswa_anchor_mask = common_attn_metadata.rswa_anchor_mask
 
         return attn_metadata
 

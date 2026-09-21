@@ -141,8 +141,8 @@ class GraniteForDoclingProcessingInfo(BaseProcessingInfo):
             self.get_hf_config(), "use_fine_route", True
         ):
             raise ValueError(
-                "This model has no fine connector path (`config.use_fine_route=False`); "
-                "`fine_route=True` is not supported."
+                "This model has no fine connector path "
+                "(`config.use_fine_route=False`); `fine_route=True` is not supported."
             )
         return image_kwargs
 

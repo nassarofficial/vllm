@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Decode-side DocLang grammar-anchor tracking for R-SWA.
 
 implementation) so the vLLM worker can reproduce the anchor liveness the model
@@ -65,8 +66,16 @@ _PAIRED_TAGS: dict[str, str] = {
 
 _TABLE_OPEN_STRINGS = ("<table>", "<tabular>")
 _ROW_STRUCT_STRINGS = (
-    "<fcel/>", "<ecel/>", "<ched/>", "<rhed/>", "<corn/>",
-    "<srow/>", "<lcel/>", "<ucel/>", "<xcel/>", "<nl/>",
+    "<fcel/>",
+    "<ecel/>",
+    "<ched/>",
+    "<rhed/>",
+    "<corn/>",
+    "<srow/>",
+    "<lcel/>",
+    "<ucel/>",
+    "<xcel/>",
+    "<nl/>",
 )
 _NL_STRING = "<nl/>"
 _THREAD_PREFIX_STRINGS = ('<thread thread_id="', '<xref thread_id="')
@@ -102,7 +111,7 @@ class DocLangTagIds:
     location_ids: frozenset[int]
 
     @classmethod
-    def from_tokenizer(cls, tokenizer) -> "DocLangTagIds":
+    def from_tokenizer(cls, tokenizer) -> DocLangTagIds:
         open_to_close: dict[int, int] = {}
         for open_s, close_s in _PAIRED_TAGS.items():
             o, c = _tid(tokenizer, open_s), _tid(tokenizer, close_s)
