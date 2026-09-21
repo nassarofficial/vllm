@@ -634,6 +634,8 @@ class KVCacheManager:
             processed_computed_tokens: Computed-token prefix length covering
                 fully processed and committed tokens only (safe to free).
             num_prompt_tokens: Optional prompt length for R-SWA gap eviction.
+            token_ids: Optional token ids of the request. R-SWA managers with grammar
+                anchors use them to keep anchor blocks; other manager types ignore it.
 
         """
         self.coordinator.remove_skipped_blocks(

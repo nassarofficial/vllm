@@ -702,6 +702,8 @@ class SingleTypeKVCacheManager(ABC):
             num_prompt_tokens: Optional prompt length for attention types (e.g.
                 R-SWA) that evict a middle gap rather than a head prefix. Ignored
                 by the default implementation.
+            token_ids: Optional token ids of the request. R-SWA managers with grammar
+                anchors use them to keep anchor blocks; other manager types ignore it.
 
         """
         del num_prompt_tokens
