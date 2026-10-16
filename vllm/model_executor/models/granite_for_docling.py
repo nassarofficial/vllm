@@ -11,6 +11,8 @@
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Literal, TypeAlias
 
+import re
+
 import torch
 from torch import nn
 from transformers import BatchFeature, GraniteForDoclingProcessor
@@ -73,6 +75,7 @@ from .interfaces import (
 )
 from .utils import (
     AutoWeightsLoader,
+    WeightsMapper,
     _merge_multimodal_embeddings,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -123,6 +126,22 @@ ImageInputs: TypeAlias = (
 # -----------------------------------------------------------------------------
 
 
+def _get_tile_info(
+    image_processor, height: int, width: int, image_kwargs: Mapping[str, object]
+) -> tuple[int, int, int]:
+    """``(num_tiles incl. thumbnail, num_rows, num_cols)`` for an image size.
+
+    Transformers PR #49012 returns only the tile count from
+    ``get_number_of_image_patches`` and exposes the grid through ``get_tile_grid``;
+    older image processors return the three values from ``get_number_of_image_patches``.
+    """
+    if hasattr(image_processor, "get_tile_grid"):
+        num_rows, num_cols = image_processor.get_tile_grid(height, width, image_kwargs)
+        num_tiles = num_rows * num_cols
+        return (num_tiles + 1 if num_tiles > 1 else 1), num_rows, num_cols
+    return image_processor.get_number_of_image_patches(height, width, image_kwargs)
+
+
 class GraniteForDoclingProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(
         self, *, fine_route: bool | None = None, **kwargs: object
@@ -163,8 +182,11 @@ class GraniteForDoclingProcessingInfo(BaseProcessingInfo):
         processor: GraniteForDoclingProcessor,
         mm_kwargs: Mapping[str, object],
     ) -> int:
-        num_patches, _, _ = processor.image_processor.get_number_of_image_patches(
-            image_height, image_width, self.get_image_kwargs(mm_kwargs)
+        num_patches, _, _ = _get_tile_info(
+            processor.image_processor,
+            image_height,
+            image_width,
+            self.get_image_kwargs(mm_kwargs),
         )
         return num_patches * self.get_image_seq_len(processor, mm_kwargs)
 
@@ -177,8 +199,8 @@ class GraniteForDoclingProcessingInfo(BaseProcessingInfo):
         mm_kwargs: Mapping[str, object],
     ) -> str:
         image_kwargs = self.get_image_kwargs(mm_kwargs)
-        _, num_rows, num_cols = processor.image_processor.get_number_of_image_patches(
-            image_height, image_width, image_kwargs
+        _, num_rows, num_cols = _get_tile_info(
+            processor.image_processor, image_height, image_width, image_kwargs
         )
         return processor.replace_image_token(
             {"rows": [[num_rows]], "cols": [[num_cols]]},
@@ -202,13 +224,30 @@ class GraniteForDoclingDummyInputsBuilder(
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
         image_processor = self.info.get_hf_processor().image_processor
-        # The grid with the most tiles the image processor can select
-        num_cols, num_rows = max(
-            get_all_supported_aspect_ratios(
-                image_processor.min_patches, image_processor.max_patches
-            ),
-            key=lambda grid: grid[0] * grid[1],
+        # The grid with the most tiles the image processor can select. The spread rule
+        # (``dense_max_patches`` in the preprocessor config, or in the server's
+        # ``mm_processor_kwargs``) tiles landscape, under-resolved pages with up to
+        # ``dense_max_patches`` tiles.
+        image_kwargs = self.info.get_image_kwargs({})
+        max_patches = max(
+            image_kwargs.get("max_patches", image_processor.max_patches),
+            image_kwargs.get(
+                "dense_max_patches", getattr(image_processor, "dense_max_patches", 0)
+            )
+            or 0,
         )
+        try:
+            grids = get_all_supported_aspect_ratios(
+                image_processor.min_patches,
+                max_patches,
+                getattr(image_processor, "max_tiles_per_side", 16),
+            )
+        except TypeError:
+            # transformers without the per-side tile cap argument
+            grids = get_all_supported_aspect_ratios(
+                image_processor.min_patches, max_patches
+            )
+        num_cols, num_rows = max(grids, key=lambda grid: grid[0] * grid[1])
         image_overrides = mm_options.get("image") if mm_options else None
 
         return {
@@ -252,8 +291,8 @@ class GraniteForDoclingMultiModalProcessor(
         ).get_items("image", ImageProcessorItems)
         processed_data["num_patches"] = torch.tensor(
             [
-                image_processor.get_number_of_image_patches(
-                    image_size.height, image_size.width, image_kwargs
+                _get_tile_info(
+                    image_processor, image_size.height, image_size.width, image_kwargs
                 )[0]
                 for image_size in map(
                     parsed_images.get_image_size, range(len(parsed_images))
@@ -1034,11 +1073,15 @@ class GraniteForDoclingTextModel(nn.Module):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
+            # Native transformers layout: gate/up/down projections of the Granite MLP
+            (".shared_mlp.input_linear", ".mlp.gate_proj", 0),
+            (".shared_mlp.input_linear", ".mlp.up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            name = name.replace(".mlp.down_proj.", ".shared_mlp.output_linear.")
             if is_pp_missing_parameter(name, self):
                 continue
             mapped = False
@@ -1133,7 +1176,11 @@ class GraniteForDoclingModel(nn.Module):
             vllm_config=vllm_config.with_hf_config(config.text_config),
             prefix=maybe_prefix(prefix, "text_model"),
         )
-        self.text_model.set_deepstack_attn_layers(config.deepstack_attn_layers)
+        # DeepStack feature i goes after decoder layer i unless configured otherwise
+        self.text_model.set_deepstack_attn_layers(
+            getattr(config, "deepstack_attn_layers", None)
+            or list(range(len(config.deepstack_visual_indexes)))
+        )
         # Optional modules are declared by the config, like in the HF model:
         # ``density_router_hidden_size`` -> router, ``use_fine_route`` -> fine
         # connector path, ``num_mtp_layers`` -> MTP heads (on the top-level model).
@@ -1487,6 +1534,7 @@ class GraniteForDoclingForConditionalGeneration(
         return probability >= self.config.density_router_threshold
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = self._require_new_layout(weights)
         # Tensors of an optional module are skipped only when the config says the
         # checkpoint does not have that module; a declared module must load.
         ignore_prefixes = []
@@ -1500,7 +1548,40 @@ class GraniteForDoclingForConditionalGeneration(
                 "model.connector.deepstack_mergers_fine.",
             ]
         loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=ignore_prefixes)
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    # Only the checkpoint layout of transformers PR #49012 loads: the connector sits
+    # inside the vision model and groups its two paths in `connector.routes.{coarse,
+    # fine}` (nn.ModuleDict); the Granite MLP has gate/up/down projections. The
+    # names below map onto the names this module uses internally.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"model.vision_model.connector.": "model.connector."},
+        orig_to_new_substr={
+            "routes.coarse.projection.weight": "modality_projection.proj.weight",
+            "routes.coarse.deepstack_mergers.": "deepstack_mergers.",
+            "routes.fine.projection.weight": "proj_fine.weight",
+            "routes.fine.deepstack_mergers.": "deepstack_mergers_fine.",
+        },
+    )
+
+    # Key patterns of the layouts written before the PR layout: the fork export
+    # (`model.connector.*`, fused `shared_mlp.input_linear`) and the first native
+    # export (connector paths directly under `vision_model.connector`).
+    _OLD_LAYOUT_KEYS = re.compile(
+        r"^model\.connector\.|\.shared_mlp\.|"
+        r"^model\.vision_model\.connector\.(modality_projection|deepstack_mergers|proj_fine|deepstack_mergers_fine)\."
+    )
+
+    @classmethod
+    def _require_new_layout(cls, weights):
+        for name, tensor in weights:
+            if cls._OLD_LAYOUT_KEYS.search(name):
+                raise ValueError(
+                    f"Checkpoint tensor `{name}` is in an old GraniteForDocling layout. This model loads only "
+                    "the transformers PR #49012 layout (`model.vision_model.connector.routes.{coarse,fine}.*`, "
+                    "`mlp.{gate,up,down}_proj`); convert the checkpoint first (tools: to_pr_layout.py)."
+                )
+            yield name, tensor
 
     def get_language_model(self) -> nn.Module:
         return self.model.text_model
